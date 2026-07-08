@@ -2,7 +2,7 @@
 
 **v0.30.0-alpha.10** — Argosvix MCP server lets AI agents (Claude Desktop, Cursor, Codex CLI, custom MCP clients) query, manage, and operate their LLM observability data directly from the conversation. Supports both **stdio** (subprocess) and **HTTP** (remote / self-host) transports.
 
-**Surface:** 87 tools (84 generally available + 3 founder-ops scoped) / 3 resources / 8 resource templates / 3 prompts. Autonomous-AI-ops endpoints (`get_account_health` / `detect_anomaly` / `propose_alert_rules` / `classify_calls_batch` / `propose_eval_criteria`) plus runtime control plane (budget gates / policy gates / human-approval gates) complete the "agent that can both observe AND act" narrative. See [CHANGELOG.md](./CHANGELOG.md) for release history.
+**Surface:** 87 tools (84 generally available + 3 founder-ops scoped) / 3 resources / 8 resource templates / 3 prompts. Autonomous-AI-ops endpoints (`get_account_health` / `detect_anomaly` / `propose_alert_rules` / `classify_calls_batch` / `propose_eval_criteria`) plus runtime control plane (budget gates / policy gates / human-approval gates) complete the "agent that can both observe AND act" narrative. Release history is available on [npm](https://www.npmjs.com/package/@argosvix/mcp-server?activeTab=versions).
 
 [![npm version](https://img.shields.io/npm/v/@argosvix/mcp-server)](https://npmjs.com/package/@argosvix/mcp-server)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -44,6 +44,8 @@ Edit your Claude Desktop config:
 ```
 
 Restart Claude Desktop. All 87 tools appear under the `argosvix__` prefix (e.g. `argosvix__query_calls`, `argosvix__get_account_health`, `argosvix__create_budget_gate`).
+
+> **No API key yet?** The server also starts without `ARGOSVIX_API_KEY` in introspection-only mode (since v0.30.0-alpha.14): all 87 tools are listed so you can evaluate the surface, and any tool call returns instructions for getting a key at https://dashboard.argosvix.com/api-keys.
 
 ## Configure (Cursor)
 
