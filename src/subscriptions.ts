@@ -197,6 +197,15 @@ export function setupSubscribe(ctx: SubscribeContext): SubscribeManager {
 
   ctx.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
     const uri = request.params.uri;
+    if (!ctx.apiKey) {
+      // introspection-only モード(キー無し起動、2026-07)では購読を受け付けない。
+      // 受けると 60 秒ごとの空キー 401 polling が永続する(Codex LOW)。
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        "ARGOSVIX_API_KEY is required for subscriptions. Get a key at " +
+          "https://dashboard.argosvix.com/api-keys and set it in the MCP server env.",
+      );
+    }
     if (!SUBSCRIBABLE_URIS.has(uri)) {
       // Codex round 1 MEDIUM 1 fix carry = McpError(InvalidParams) で throw して
       // client に正しい -32602 を返す (= 旧実装は raw Error で SDK が

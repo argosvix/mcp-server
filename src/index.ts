@@ -98,13 +98,17 @@ if (useHttp) {
   const activeToolNames = new Set(activeTools.map((t) => t.name));
 
   if (!API_KEY) {
+    // キー無しでも起動する introspection-only モード(2026-07 追加)。
+    // ディレクトリの自動チェック(キー無し起動 + tools/list 応答)と、
+    // 「キー設定前にツール一覧を見て判断したい」初見 UX の両方に必要。
+    // ツールの実行だけが下の CallTool ガードで案内文つきエラーになる。
     // eslint-disable-next-line no-console
     console.error(
-      "[argosvix-mcp] ARGOSVIX_API_KEY env var is required for stdio mode. " +
+      "[argosvix-mcp] ARGOSVIX_API_KEY is not set — starting in introspection-only mode. " +
+        "Tools are listed but calls will fail until you set ARGOSVIX_API_KEY. " +
         "Get a key at https://dashboard.argosvix.com/api-keys " +
-        "(use --http flag for HTTP transport with per-request auth)",
+        "(or use --http flag for HTTP transport with per-request auth)",
     );
-    process.exit(1);
   }
 
   const server = new Server(
@@ -132,6 +136,24 @@ if (useHttp) {
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+    if (!API_KEY) {
+      // introspection-only モード: 一覧は見せるが実行はキー設定の案内を返す。
+      // protocol error でなく isError の tool 結果にする = LLM がそのまま
+      // ユーザーに設定手順を伝えられる形。
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "ARGOSVIX_API_KEY is not set. Get an API key at " +
+              "https://dashboard.argosvix.com/api-keys, add it to the env of this " +
+              'MCP server config (e.g. "env": { "ARGOSVIX_API_KEY": "argk_..." }), ' +
+              "then restart the MCP client.",
+          },
+        ],
+        isError: true,
+      };
+    }
     if (!activeToolNames.has(name)) {
       throw new McpError(
         ErrorCode.InvalidParams,
@@ -167,7 +189,9 @@ if (useHttp) {
     try {
       return await readResource({
         uri: request.params.uri,
-        apiKey: API_KEY,
+        // introspection-only モードでは空キーで API に行き 401 が明示エラーとして
+        // 返る(resource read はキー必須のまま)。
+        apiKey: API_KEY ?? "",
         apiBase: API_BASE,
       });
     } catch (err) {
@@ -208,7 +232,7 @@ if (useHttp) {
 
   const subscribeManager = setupSubscribe({
     server,
-    apiKey: API_KEY,
+    apiKey: API_KEY ?? "",
     apiBase: API_BASE,
   });
 

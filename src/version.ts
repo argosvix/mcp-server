@@ -12,4 +12,4 @@
  *   3. `npm run build && npx vitest run` を pass させてから commit
  */
 
-export const MCP_VERSION = "0.30.0-alpha.13" as const;
+export const MCP_VERSION = "0.30.0-alpha.14" as const;

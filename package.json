@@ -1,6 +1,6 @@
 {
   "name": "@argosvix/mcp-server",
-  "version": "0.30.0-alpha.13",
+  "version": "0.30.0-alpha.14",
   "mcpName": "com.argosvix/server",
   "description": "Argosvix MCP server — AI agent から traces / cost / alert / annotations / eval-criteria / prompts / safety / eval-runs / eval-gate / llm-budget / budget-gate / policy-gate / approvals / members / saved-views / audit-log / projects / account-health / alert-proposals / anomaly-detection / classify-batch / eval-criteria-propose / purge-expired-plaintext / retry-failed-webhook / auto-silence-noisy-alert / outbound-webhooks を直接 query / 監査 / 受領 / 調整するための Model Context Protocol server (stdio + HTTP transport、 tools 87 件 / resources 3 件 + template 8 件 / prompts 3 件、 stdio で resources subscribe + polling 60s 更新通知).",
   "author": "Yuto Makihara <hello@argosvix.com>",
