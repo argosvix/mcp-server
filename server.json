@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.argosvix/server",
+  "description": "Observability MCP server: query LLM cost/errors/latency & operate alerts/evals from Claude/Cursor",
+  "version": "0.30.0-alpha.13",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@argosvix/mcp-server",
+      "version": "0.30.0-alpha.13",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "ARGOSVIX_API_KEY",
+          "description": "Argosvix API key (argk_...) issued from the dashboard",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}
