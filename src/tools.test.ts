@@ -8,12 +8,14 @@ import { MCP_VERSION } from "./version.js";
 
 describe("MCP version source of truth", () => {
   it("src/version.ts MCP_VERSION matches package.json version (= drift 防御)", () => {
-    // Codex round 2 LOW 2 fix + v0.4.0 round 2 MEDIUM 1 fix:
-    // version は src/version.ts に集約 + package.json と完全一致を CI で gate する。
-    // path は import.meta.url (= 本 file の絶対位置) 基準で resolve し、 monorepo root
-    // から `npx vitest --root packages/mcp-server` で 走らせた時に process.cwd() が
-    // root に なって 誤判定する path を 構造防御 (= round 1 の process.cwd() 採用は
-    // overshoot だったので 元に戻した上で 意図を comment 化)。
+    // The version is centralized in src/version.ts, and CI gates an exact
+    // match with package.json. The path is resolved relative to
+    // import.meta.url (this file's absolute location), which structurally
+    // guards against the misresolution that happens when running
+    // `npx vitest --root packages/mcp-server` from the monorepo root and
+    // process.cwd() points at the root. (An earlier process.cwd()-based
+    // approach was an overshoot and was reverted, with the intent captured in
+    // this comment.)
     const here = dirname(fileURLToPath(import.meta.url));
     const pkgPath = resolve(here, "..", "package.json");
     const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as {
@@ -125,15 +127,17 @@ describe("MCP tools metadata", () => {
   });
 
   it("create_alert.alertType enum matches backend ALERT_TYPES (= enum drift 回帰防止)", () => {
-    // backend packages/backend/src/types.ts ALERT_TYPES と完全一致させる。
-    // ここが drift すると mismatch した type の create_alert が backend で 400 になる。
-    // 2026-06-06 R37 medium #1 fix carry: 旧 hard-coded list は backend と drift
-    // していた (= 旧 list: cost_daily / cost_monthly / latency_p95、 backend reality:
-    // cost_threshold / monthly_budget / latency_degradation)。 同 hard-code を MCP
-    // description から copy していたため drift gate test 自体が drift を検出できない
-    // 構造軸だった。 backend `src/alerts/types.ts` の ALERT_TYPES を test 時点で
-    // fs.readFileSync で 読み出して regex 抽出 → これで source of truth が backend
-    // 側に固定、 backend が enum を 追加すると 本 test が 自動的に拾って fail する。
+    // Must match ALERT_TYPES in the backend exactly. If this drifts, a
+    // create_alert with a mismatched type gets a 400 from the backend.
+    // A previous hard-coded list had drifted from the backend (old list:
+    // cost_daily / cost_monthly / latency_p95; backend reality:
+    // cost_threshold / monthly_budget / latency_degradation). Because the same
+    // hard-coded values were copied into the MCP description, the drift gate
+    // test itself was structurally unable to detect the drift. The fix reads
+    // ALERT_TYPES from the backend's `src/alerts/types.ts` at test time via
+    // fs.readFileSync and extracts it with a regex — pinning the source of
+    // truth on the backend side, so when the backend adds an enum value this
+    // test automatically picks it up and fails.
     const here2 = dirname(fileURLToPath(import.meta.url));
     const backendTypesPath = resolve(here2, "..", "..", "backend", "src", "alerts", "types.ts");
     const backendTypesContent = readFileSync(backendTypesPath, "utf8");
@@ -158,10 +162,11 @@ describe("MCP tools metadata", () => {
   });
 
   it("aggregate_calls の groupBy / metric enum が backend VALID_GROUP_BY / VALID_METRIC と一致 (= enum drift 回帰防止)", () => {
-    // 2026-06-17 = REST に input_tokens/output_tokens metric と groupBy=error を足した時、
-    // MCP enum を mirror し忘れて「ダッシュボードで出来るのに AI が問えない」drift が出た
-    // (MCP-first 違反)。 backend packages/backend/src/query.ts の allowlist を source of
-    // truth に固定し、 backend が増やすと本 test が拾って fail させる。
+    // When the input_tokens/output_tokens metrics and groupBy=error were added
+    // to REST, mirroring the MCP enum was forgotten, producing a drift where
+    // "the dashboard can do it but the AI cannot ask for it". The allowlist in
+    // the backend's query.ts is pinned as the source of truth, so when the
+    // backend grows this test picks it up and fails.
     const here2 = dirname(fileURLToPath(import.meta.url));
     const queryPath = resolve(here2, "..", "..", "backend", "src", "query.ts");
     const queryContent = readFileSync(queryPath, "utf8");
@@ -237,8 +242,9 @@ describe("dispatchTool", () => {
   });
 
   it("query_calls POSTs JSON body with rangePreset converted to startTime/endTime", async () => {
-    // 0.3.1-alpha.1 fix: backend `/v1/query/calls` は POST 専用 + ISO range を body で
-    // 受け取る。 rangePreset は MCP server 側で wall-clock 変換する。
+    // The backend `/v1/query/calls` is POST-only and takes an ISO range in
+    // the body. rangePreset is converted to wall-clock values on the MCP
+    // server side.
     const res = await dispatchTool({
       name: "query_calls",
       args: { limit: 10, provider: "openai", rangePreset: "7d" },
@@ -259,13 +265,13 @@ describe("dispatchTool", () => {
     expect(body.provider).toBe("openai");
     expect(typeof body.startTime).toBe("string");
     expect(typeof body.endTime).toBe("string");
-    // 7d 後ろから now まで = 終端より始端が前
+    // From 7 days back until now — the start precedes the end.
     expect(new Date(body.startTime).getTime()).toBeLessThan(
       new Date(body.endTime).getTime(),
     );
   });
 
-  it("R74 HIGH 1 regression: query_calls の latencyMin/Max が outgoing body に乗る (= allowlist 落ち防止)", async () => {
+  it("regression: query_calls の latencyMin/Max が outgoing body に乗る (= allowlist 落ち防止)", async () => {
     const res = await dispatchTool({
       name: "query_calls",
       args: { latencyMin: 1500, latencyMax: 2500 },
@@ -293,6 +299,21 @@ describe("dispatchTool", () => {
     const body = JSON.parse(init.body as string);
     expect(body.beforeTimestamp).toBe("2026-06-11T12:00:00.000Z");
     expect(body.beforeId).toBe("rec_abc");
+  });
+
+  it("2026-07-10 tag filter: query_calls の tagKey/tagValue が outgoing body に乗る (= allowlist 落ちで silent drop していた回帰防止)", async () => {
+    const res = await dispatchTool({
+      name: "query_calls",
+      args: { tagKey: "env", tagValue: "production" },
+      apiKey: "argosvix_live_test",
+      apiBase: "https://ingest.example.com",
+    });
+    expect(res.isError).toBeUndefined();
+    const fetchMock = global.fetch as unknown as ReturnType<typeof vi.fn>;
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const body = JSON.parse(init.body as string);
+    expect(body.tagKey).toBe("env");
+    expect(body.tagValue).toBe("production");
   });
 
   it("get_cost_summary uses /v1/query/aggregate endpoint", async () => {
@@ -332,7 +353,7 @@ describe("dispatchTool", () => {
     const fetchMock = global.fetch as unknown as ReturnType<typeof vi.fn>;
     const fetchedUrl = String(fetchMock.mock.calls[0]?.[0]);
     expect(fetchedUrl).toContain("/v1/memberships");
-    // read tool = GET (= 明示 method 指定なし → callApi default GET)
+    // Read tool = GET (no explicit method specified → callApi defaults to GET).
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
     expect(init?.method ?? "GET").toBe("GET");
     const parsed = JSON.parse(res.content[0]?.text ?? "{}");
@@ -459,7 +480,7 @@ describe("dispatchTool", () => {
     const currentCount = JSON.stringify({ total: { value: 1500, count: 1500 } });
     const currentPercentile = JSON.stringify({ p95: 1100, total: 1500 });
     const baselineCost = JSON.stringify({ total: { value: 10.0, count: 1000 } });
-    // backend error_rate metric = percent (0-100)、 2 = 2%
+    // backend error_rate metric = percent (0-100); 2 means 2%
     const baselineError = JSON.stringify({ total: { value: 2, count: 1000 } });
     const baselineCount = JSON.stringify({ total: { value: 1000, count: 1000 } });
     const baselinePercentile = JSON.stringify({ p95: 1000, total: 1000 });
@@ -543,7 +564,7 @@ describe("dispatchTool", () => {
       })),
       total: { value: 21, count: 1400 },
     });
-    // backend error_rate metric = percent (0-100)、 1 = 1%
+    // backend error_rate metric = percent (0-100); 1 means 1%
     const errorRate = JSON.stringify({ total: { value: 1, count: 1400 } });
     const dailyCount = JSON.stringify({
       groups: Array.from({ length: 14 }, (_, i) => ({
@@ -585,8 +606,9 @@ describe("dispatchTool", () => {
     expect(parsed.baseline.totalCalls).toBe(1400);
     expect(parsed.proposals).toHaveLength(4);
     const types = parsed.proposals.map((p: { alertType: string }) => p.alertType).sort();
-    // create_alert enum と整合する type 名 (= cost_threshold / latency_degradation)。
-    // 旧 cost_daily / latency_p95 は enum 外で create できず dedup も効かなかった回帰。
+    // Type names consistent with the create_alert enum (cost_threshold /
+    // latency_degradation). The old cost_daily / latency_p95 were outside the
+    // enum, so they could not be created and dedup never worked — a regression.
     expect(types).toEqual([
       "anomaly_cost",
       "cost_threshold",
@@ -605,7 +627,7 @@ describe("dispatchTool", () => {
       groups: [{ key: "2026-05-01", value: 1.0, count: 200 }],
       total: { value: 1.0, count: 200 },
     });
-    // backend error_rate metric = percent (0-100)、 2 = 2%
+    // backend error_rate metric = percent (0-100); 2 means 2%
     const errorRate = JSON.stringify({ total: { value: 2, count: 200 } });
     const dailyCount = JSON.stringify({
       groups: [{ key: "2026-05-01", value: 200, count: 200 }],
@@ -653,11 +675,14 @@ describe("dispatchTool", () => {
 
   it("get_account_health fans out to 6 endpoints in parallel + composes summary", async () => {
     const aggregateCount = JSON.stringify({ total: { value: 1234, count: 1234 } });
-    // 注: backend error_rate metric は percent (0-100) で 返る = 2 = 2%
+    // Note: the backend error_rate metric is returned as a percent (0-100); 2 means 2%.
     const aggregateError = JSON.stringify({ total: { value: 2, count: 1234 } });
     const aggregateCost = JSON.stringify({ total: { value: 4.56, count: 1234 } });
     const percentiles = JSON.stringify({ p50: 250, p95: 1100, p99: 2400, total: 1234 });
-    const budget = JSON.stringify({ monthlyLimitUsd: 50, usedUsd: 30, remainingUsd: 20 });
+    // Note: the actual response shape of backend GET
+    // /v1/account/llm-feature-budget is { budgetUsd, spentUsd, remainingUsd,
+    // ... } (llmFeatureBudgetHandler.ts).
+    const budget = JSON.stringify({ budgetUsd: 50, spentUsd: 30, remainingUsd: 20 });
     const auditEvents = JSON.stringify({ events: [{ id: 1 }, { id: 2 }] });
     const seen: string[] = [];
     const fetchSpy = vi.fn(async (input: unknown) => {
@@ -706,7 +731,7 @@ describe("dispatchTool", () => {
     const aggregateError = JSON.stringify({ total: { value: 5, count: 100 } });
     const aggregateCost = JSON.stringify({ total: { value: 1.0, count: 100 } });
     const percentiles = JSON.stringify({ p50: 100, p95: 200, p99: 500, total: 100 });
-    const budget = JSON.stringify({ monthlyLimitUsd: 50, usedUsd: 10, remainingUsd: 40 });
+    const budget = JSON.stringify({ budgetUsd: 50, spentUsd: 10, remainingUsd: 40 });
     const auditEvents = JSON.stringify({ events: [] });
     let aggCalls = 0;
     vi.stubGlobal(
@@ -739,6 +764,51 @@ describe("dispatchTool", () => {
     expect(parsed.summary).toBe("warn");
   });
 
+  it("2026-07-10 regression: get_account_health が実 API shape (budgetUsd/spentUsd) を読んで budget 閾値で警告する (= 旧 monthlyLimitUsd/usedUsd parse では永久に ok だった)", async () => {
+    // Pin every other dimension to healthy and assert that the summary is
+    // driven by the budget alone.
+    const healthyAggregate = JSON.stringify({ total: { value: 0, count: 0 } });
+    const healthyPercentiles = JSON.stringify({ p50: 100, p95: 200, p99: 300, total: 10 });
+    const auditEvents = JSON.stringify({ events: [] });
+    const dispatchWithBudget = async (budgetBody: string) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: unknown) => {
+          const url = String(input);
+          if (url.endsWith("/v1/query/aggregate"))
+            return new Response(healthyAggregate, { status: 200 });
+          if (url.endsWith("/v1/query/percentiles"))
+            return new Response(healthyPercentiles, { status: 200 });
+          if (url.includes("/v1/account/llm-feature-budget"))
+            return new Response(budgetBody, { status: 200 });
+          return new Response(auditEvents, { status: 200 });
+        }),
+      );
+      const res = await dispatchTool({
+        name: "get_account_health",
+        args: { window: "24h" },
+        apiKey: "argosvix_live_test",
+        apiBase: "https://ingest.example.com",
+      });
+      expect(res.isError).toBeUndefined();
+      return JSON.parse(res.content[0]?.text ?? "{}");
+    };
+    // 92% used (over 90%) → critical
+    const critical = await dispatchWithBudget(
+      JSON.stringify({ budgetUsd: 50, spentUsd: 46, remainingUsd: 4 }),
+    );
+    expect(critical.budget.used).toBe(46);
+    expect(critical.budget.limit).toBe(50);
+    expect(critical.budget.percentUsed).toBe(92);
+    expect(critical.summary).toBe("critical");
+    // 76% used (over 70%, under 90%) → warn
+    const warn = await dispatchWithBudget(
+      JSON.stringify({ budgetUsd: 50, spentUsd: 38, remainingUsd: 12 }),
+    );
+    expect(warn.budget.percentUsed).toBe(76);
+    expect(warn.summary).toBe("warn");
+  });
+
   it("get_account_health survives partial endpoint failures", async () => {
     const fetchSpy = vi.fn(async (input: unknown) => {
       const url = String(input);
@@ -752,7 +822,7 @@ describe("dispatchTool", () => {
         return new Response(JSON.stringify({ p50: null, p95: null, p99: null, total: 0 }), {
           status: 200,
         });
-      return new Response(JSON.stringify({ usedUsd: 0, monthlyLimitUsd: 10 }), {
+      return new Response(JSON.stringify({ spentUsd: 0, budgetUsd: 10 }), {
         status: 200,
       });
     });
@@ -916,7 +986,7 @@ describe("dispatchTool", () => {
     expect(body.model).toBeUndefined();
   });
 
-  it("drops non-allowlisted args for query_calls body (= injection 防御 / Codex r4 HIGH 4 carry)", async () => {
+  it("drops non-allowlisted args for query_calls body", async () => {
     await dispatchTool({
       name: "query_calls",
       args: {
@@ -930,7 +1000,7 @@ describe("dispatchTool", () => {
     });
     const fetchMock = global.fetch as unknown as ReturnType<typeof vi.fn>;
     const fetchedUrl = String(fetchMock.mock.calls[0]?.[0]);
-    // path 自体は固定の /v1/query/calls (= injection で 変えられない)
+    // The path itself is fixed to /v1/query/calls (injection cannot change it).
     expect(fetchedUrl).toContain("/v1/query/calls");
     expect(fetchedUrl).not.toContain("/v1/admin/internal");
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
@@ -942,7 +1012,7 @@ describe("dispatchTool", () => {
   });
 
   it("get_cost_summary POSTs body with metric=cost + groupBy normalized", async () => {
-    // 0.3.1-alpha.1 fix: groupBy='none' は backend に存在しないので 'provider' に正規化。
+    // groupBy='none' does not exist on the backend, so it is normalized to 'provider'.
     await dispatchTool({
       name: "get_cost_summary",
       args: { rangePreset: "7d", groupBy: "none" },
@@ -962,8 +1032,8 @@ describe("dispatchTool", () => {
   });
 
   it("get_cost_summary rejects an out-of-schema groupBy (= silent 丸め 防止)", async () => {
-    // Codex round 1 MEDIUM 1 fix: backend 内部 enum (= "day" / "tag") や typo を
-    // 黙って provider に丸めずに errorResponse で明示 reject する。
+    // Backend-internal enums ("day" / "tag") and typos are explicitly
+    // rejected via errorResponse instead of being silently coerced to provider.
     const res = await dispatchTool({
       name: "get_cost_summary",
       args: { rangePreset: "7d", groupBy: "day" },
@@ -975,7 +1045,8 @@ describe("dispatchTool", () => {
   });
 
   it("query_calls User-Agent header carries the current MCP_VERSION", async () => {
-    // Codex round 1 LOW 2 fix: User-Agent が 旧 "0.1.0" 固定値だった bug を 動的版に carry。
+    // The User-Agent used to be hard-coded to "0.1.0"; it now carries the
+    // dynamic version.
     await dispatchTool({
       name: "query_calls",
       args: {},
@@ -985,12 +1056,13 @@ describe("dispatchTool", () => {
     const fetchMock = global.fetch as unknown as ReturnType<typeof vi.fn>;
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
     const ua = (init.headers as Record<string, string>)["User-Agent"];
-    // Codex round 2 LOW 3 fix: prerelease (= "-alpha.1" 等) も 明示的に許可する semver
-    // regex に carry (= prefix match の暗黙性を解消、 意図を明文化)。
+    // A semver regex that also explicitly allows prereleases ("-alpha.1"
+    // etc.), removing the implicitness of a prefix match and making the
+    // intent explicit.
     expect(ua).toMatch(
       /^argosvix-mcp-server\/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/,
     );
-    // 旧固定値 (= 0.1.0) は 含まれない (= regression 防御)
+    // The old fixed value (0.1.0) never appears (regression guard).
     expect(ua).not.toBe("argosvix-mcp-server/0.1.0");
   });
 
@@ -1043,7 +1115,7 @@ describe("dispatchTool", () => {
       apiBase: "https://ingest.example.com",
     });
     expect(res.isError).toBeUndefined();
-    // 204 path = ok:true JSON で carry される
+    // The 204 path returns ok:true JSON.
     const parsed = JSON.parse(res.content[0]?.text ?? "{}");
     expect(parsed.ok).toBe(true);
     expect(parsed.status).toBe(204);
@@ -1053,7 +1125,7 @@ describe("dispatchTool", () => {
     expect(init.body).toBeUndefined();
   });
 
-  it("update_alert sends PATCH to /v1/alerts/:id with allowlisted body (= v1.6 #13-4)", async () => {
+  it("update_alert sends PATCH to /v1/alerts/:id with allowlisted body", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -1084,7 +1156,7 @@ describe("dispatchTool", () => {
     expect(init.method).toBe("PATCH");
     const body = JSON.parse(init.body as string);
     expect(body).toEqual({ name: "renamed", thresholdValue: 50, enabled: false });
-    // alertId は path に carry、 body には混入しない
+    // alertId goes in the path and never leaks into the body.
     expect(body.alertId).toBeUndefined();
   });
 
@@ -1099,7 +1171,7 @@ describe("dispatchTool", () => {
     expect(res.content[0]?.text).toContain("alertId required");
   });
 
-  it("delete_alert sends DELETE to /v1/alerts/:id without body (= v1.6 #13-4)", async () => {
+  it("delete_alert sends DELETE to /v1/alerts/:id without body", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => new Response(null, { status: 204 })),
@@ -1134,7 +1206,7 @@ describe("dispatchTool", () => {
     expect(res.content[0]?.text).toContain("alertId required");
   });
 
-  it("create_annotation POSTs allowlisted body to /v1/annotations (= v1.6 #13-3)", async () => {
+  it("create_annotation POSTs allowlisted body to /v1/annotations", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -1182,7 +1254,7 @@ describe("dispatchTool", () => {
     expect(res.content[0]?.text).toContain("callId required");
   });
 
-  it("update_annotation sends PATCH with allowlisted body (= v1.6 #13-3)", async () => {
+  it("update_annotation sends PATCH with allowlisted body", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -1210,11 +1282,11 @@ describe("dispatchTool", () => {
     expect(init.method).toBe("PATCH");
     const body = JSON.parse(init.body as string);
     expect(body).toEqual({ label: "renamed", qualityScore: 4 });
-    // annotationId は path に carry、 body には混入しない
+    // annotationId goes in the path and never leaks into the body.
     expect(body.annotationId).toBeUndefined();
   });
 
-  it("delete_annotation sends DELETE to /v1/annotations/:id without body (= v1.6 #13-3)", async () => {
+  it("delete_annotation sends DELETE to /v1/annotations/:id without body", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => new Response(null, { status: 204 })),
@@ -1237,7 +1309,7 @@ describe("dispatchTool", () => {
     expect(init.body).toBeUndefined();
   });
 
-  it("create_prompt POSTs allowlisted body to /v1/prompts (= v1.6 #13-1)", async () => {
+  it("create_prompt POSTs allowlisted body to /v1/prompts", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -1278,7 +1350,7 @@ describe("dispatchTool", () => {
     });
   });
 
-  it("create_prompt rejects missing name/version/template (= v1.6 #13-1)", async () => {
+  it("create_prompt rejects missing name/version/template", async () => {
     const res = await dispatchTool({
       name: "create_prompt",
       args: { name: "x" },
@@ -1289,7 +1361,7 @@ describe("dispatchTool", () => {
     expect(res.content[0]?.text).toContain("name + version + template required");
   });
 
-  it("update_prompt sends PATCH to /v1/prompts/:id with allowlisted body (= v1.6 #13-1)", async () => {
+  it("update_prompt sends PATCH to /v1/prompts/:id with allowlisted body", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -1320,7 +1392,7 @@ describe("dispatchTool", () => {
     expect(body.promptId).toBeUndefined();
   });
 
-  it("rename_prompt POSTs to /v1/prompts/:id/rename with name+version body (= v1.6 #13-1)", async () => {
+  it("rename_prompt POSTs to /v1/prompts/:id/rename with name+version body", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -1346,7 +1418,7 @@ describe("dispatchTool", () => {
     expect(body).toEqual({ name: "customer_support", version: "v2" });
   });
 
-  it("rename_prompt rejects missing name/version (= v1.6 #13-1)", async () => {
+  it("rename_prompt rejects missing name/version", async () => {
     const res = await dispatchTool({
       name: "rename_prompt",
       args: { promptId: 7, name: "x" },
@@ -1357,7 +1429,7 @@ describe("dispatchTool", () => {
     expect(res.content[0]?.text).toContain("name + version required");
   });
 
-  it("delete_prompt sends DELETE to /v1/prompts/:id without body (= v1.6 #13-1)", async () => {
+  it("delete_prompt sends DELETE to /v1/prompts/:id without body", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => new Response(null, { status: 204 })),
@@ -1380,7 +1452,7 @@ describe("dispatchTool", () => {
     expect(init.body).toBeUndefined();
   });
 
-  it("create_eval_criterion POSTs allowlisted body to /v1/eval-criteria (= v1.6 #13-2)", async () => {
+  it("create_eval_criterion POSTs allowlisted body to /v1/eval-criteria", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -1417,7 +1489,7 @@ describe("dispatchTool", () => {
     });
   });
 
-  it("create_eval_criterion rejects missing required fields (= v1.6 #13-2)", async () => {
+  it("create_eval_criterion rejects missing required fields", async () => {
     const res = await dispatchTool({
       name: "create_eval_criterion",
       args: { name: "x" },
@@ -1457,7 +1529,7 @@ describe("dispatchTool", () => {
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
     expect(init.method).toBe("POST");
     const body = JSON.parse(init.body as string);
-    // allowlist 外の "evil" は除去される
+    // The non-allowlisted "evil" is removed.
     expect(body.evil).toBeUndefined();
     expect(body.url).toBe("https://example.com/hook");
     expect(body.eventTypes).toEqual(["approval.requested"]);
@@ -1511,7 +1583,7 @@ describe("dispatchTool", () => {
     expect(res.content[0]?.text).toContain("webhookId required");
   });
 
-  it("update_eval_criterion sends PATCH with full body to /v1/eval-criteria/:id (= v1.6 #13-2)", async () => {
+  it("update_eval_criterion sends PATCH with full body to /v1/eval-criteria/:id", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -1549,7 +1621,7 @@ describe("dispatchTool", () => {
     expect(body.criterionId).toBeUndefined();
   });
 
-  it("get_llm_budget hits /v1/account/llm-feature-budget GET (= v1.6 #13-7)", async () => {
+  it("get_llm_budget hits /v1/account/llm-feature-budget GET", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -1573,7 +1645,7 @@ describe("dispatchTool", () => {
     expect(init.method ?? "GET").toBe("GET");
   });
 
-  it("raise_llm_budget PATCHes /v1/account/llm-feature-budget with budgetUsd (= v1.6 #13-7)", async () => {
+  it("raise_llm_budget PATCHes /v1/account/llm-feature-budget with budgetUsd", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -1599,7 +1671,7 @@ describe("dispatchTool", () => {
     expect(body).toEqual({ budgetUsd: 30 });
   });
 
-  it("raise_llm_budget rejects missing budgetUsd (= v1.6 #13-7)", async () => {
+  it("raise_llm_budget rejects missing budgetUsd", async () => {
     const res = await dispatchTool({
       name: "raise_llm_budget",
       args: {},
@@ -1610,7 +1682,7 @@ describe("dispatchTool", () => {
     expect(res.content[0]?.text).toContain("budgetUsd required");
   });
 
-  it("test_webhook POSTs allowlisted body to /v1/alerts/test-webhook (= v1.6 #13-5)", async () => {
+  it("test_webhook POSTs allowlisted body to /v1/alerts/test-webhook", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -1644,7 +1716,7 @@ describe("dispatchTool", () => {
     });
   });
 
-  it("test_webhook rejects missing url (= v1.6 #13-5)", async () => {
+  it("test_webhook rejects missing url", async () => {
     const res = await dispatchTool({
       name: "test_webhook",
       args: { secret: "shhh" },
@@ -1655,7 +1727,7 @@ describe("dispatchTool", () => {
     expect(res.content[0]?.text).toContain("url required");
   });
 
-  it("delete_eval_criterion sends DELETE to /v1/eval-criteria/:id without body (= v1.6 #13-2)", async () => {
+  it("delete_eval_criterion sends DELETE to /v1/eval-criteria/:id without body", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => new Response(null, { status: 204 })),
@@ -1881,7 +1953,8 @@ describe("dispatchTool", () => {
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
     expect(init.method).toBe("POST");
     const body = JSON.parse(init.body as string);
-    // source は MCP server 側で 強制的に "mcp" carry (= LLM 経由で override 不可)
+    // source is forced to "mcp" on the MCP server side (cannot be overridden
+    // via the LLM).
     expect(body.source).toBe("mcp");
   });
 
@@ -1907,8 +1980,9 @@ describe("dispatchTool", () => {
   });
 
   it("acknowledge_alert drops LLM-supplied source field (= 強制 mcp carry)", async () => {
-    // LLM が source: "dashboard" を渡しても、 TOOL_ARG_ALLOWLIST.acknowledge_alert に
-    // source が 含まれていないため drop され、 dispatch 側で source: "mcp" 固定が carry。
+    // Even if the LLM passes source: "dashboard", it is dropped because
+    // TOOL_ARG_ALLOWLIST.acknowledge_alert does not include source, and the
+    // dispatch side pins source: "mcp".
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -1949,12 +2023,12 @@ describe("dispatchTool", () => {
     expect(url).not.toContain("account_id");
   });
 
-  // 2026-06-09 v1.7 hygiene #13 carry = v1.5/v1.6 で追加した 7 safety/eval
-  // read tools の path + method 固定 test。 既存は metadata gate のみで dispatch
-  // path/body 軸の structural drift 防御がなかった軸を carry。
-  // R51 LOW carry (2026-06-10): toContain → new URL(...).pathname + exact searchParams
-  // で suffix/prefix drift を 構造的に検出 (= 旧 path = `/v1/eval-runs` が
-  // `/v1/eval-runs/foo` でも pass する弱さを narrow)。
+  // Path + method pinning tests for the 7 safety/eval read tools. Previously
+  // only the metadata gate existed, with no structural drift defense on the
+  // dispatch path/body dimension.
+  // Uses new URL(...).pathname + exact searchParams instead of toContain to
+  // structurally detect suffix/prefix drift (narrowing the weakness where a
+  // check for `/v1/eval-runs` also passed for `/v1/eval-runs/foo`).
 
   function urlOf(call: unknown): URL {
     return new URL(String(call));

@@ -8,8 +8,9 @@ import {
 } from "./tools.js";
 
 /**
- * 2026-07-02 #6 = core プロファイル(ARGOSVIX_MCP_PROFILE=core)。
- * 87 ツール全載せのコンテキスト圧迫への対処。既定 full = 挙動不変を固定する。
+ * The core profile (ARGOSVIX_MCP_PROFILE=core): a countermeasure against the
+ * context pressure of exposing all 87 tools. Pins that the default (full)
+ * keeps behavior unchanged.
  */
 describe("tool profile (core / full)", () => {
   it("CORE_TOOL_NAMES は実在するツール名のみ(タイプミス・改名ドリフトを CI で検出)", () => {

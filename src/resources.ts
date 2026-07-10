@@ -1,25 +1,27 @@
 /**
- * MCP resource definitions + reader (= Phase 3、 2026-05-31)。
+ * MCP resource definitions and reader.
  *
- * Resource は 「AI agent に 自動的に 文脈として渡す read-only data」 (= tools が
- * 「呼ぶ」 のに対し resource は 「読み込む」)。 host application が 自前で 選んで
- * context に入れるか、 prompt から `resource` content として 埋め込むことができる。
+ * A resource is read-only data automatically provided to the AI agent as
+ * context (tools are "called", resources are "read"). The host application
+ * can pick them into context on its own, or embed them from a prompt as
+ * `resource` content.
  *
- * v0.7.0-alpha.1 で expose する 3 resources + 1 resource template:
- *   - argosvix://account        = plan / quota / 今月の record 使用量 snapshot
- *                                 (= /v1/account、 Bearer 専用の non-sensitive identity
- *                                 endpoint、 subscription detail は含まない)
- *   - argosvix://alerts/active  = enabled な alert 一覧 (= /v1/alerts、 list_alerts と同 path)
- *   - argosvix://cost/today     = 直近 24h の cost 集計 (= /v1/query/aggregate POST、
- *                                 get_cost_summary(rangePreset=24h, groupBy=provider) と同等)
- *   - argosvix://calls/{id}     = 単一 LLM call record (= /v1/query/calls/:id GET、
- *                                 resource template、 LLM が query_calls の id を
- *                                 直接 context に取り込める)
+ * Static resources exposed since v0.7.0-alpha.1:
+ *   - argosvix://account        = snapshot of plan / quota / this month's record
+ *                                 usage (/v1/account, a Bearer-only non-sensitive
+ *                                 identity endpoint; excludes subscription detail)
+ *   - argosvix://alerts/active  = list of enabled alerts (/v1/alerts, same path
+ *                                 as list_alerts)
+ *   - argosvix://cost/today     = cost aggregation for the last 24h
+ *                                 (POST /v1/query/aggregate, equivalent to
+ *                                 get_cost_summary(rangePreset=24h, groupBy=provider))
+ *   - argosvix://calls/{id}     = a single LLM call record (GET /v1/query/calls/:id,
+ *                                 resource template; lets the LLM pull a
+ *                                 query_calls id directly into context)
  *
- * v0.8 backlog: subscribe / listChanged、 alerts/{id} template、 traces/{id} template。
- *
- * dispatch / fetch 規約は tools.ts と揃える (= POST + JSON body、 User-Agent に MCP_VERSION、
- * redirect: error、 Bearer 認証)。 backend 仕様乖離による 405 / 401 を 再発させない。
+ * Dispatch / fetch conventions match tools.ts (POST + JSON body, MCP_VERSION in
+ * User-Agent, redirect: error, Bearer auth) to avoid recurring 405 / 401 errors
+ * from drifting away from the backend contract.
  */
 
 import type {
@@ -34,62 +36,68 @@ const ACCOUNT_URI = "argosvix://account";
 const ALERTS_ACTIVE_URI = "argosvix://alerts/active";
 const COST_TODAY_URI = "argosvix://cost/today";
 
-// 2026-05-31 = Phase 3 resource template (= URI template、 client が id を 差し込んで
-// 動的 URI を 組み立てる軸)。 backend GET /v1/query/calls/:id と 1:1 対応。
+// Resource template (URI template; the client substitutes an id to build a
+// dynamic URI). Maps 1:1 to backend GET /v1/query/calls/:id.
 const CALLS_TEMPLATE_URI = "argosvix://calls/{id}";
 const CALL_URI_PATTERN = /^argosvix:\/\/calls\/([A-Za-z0-9_-]{1,128})$/;
 
-// 2026-05-31 = Phase 3 alerts/{id} resource template (= 既存 backend GET /v1/alerts/:id
-// を 経由、 get_alert tool と 同じ endpoint だが resource として template 経由で
-// host application が context に carry できる pattern)。
+// alerts/{id} resource template (via the existing backend GET /v1/alerts/:id;
+// same endpoint as the get_alert tool, but exposed as a resource template so
+// the host application can bring it into context).
 const ALERTS_TEMPLATE_URI = "argosvix://alerts/{id}";
 const ALERT_URI_PATTERN = /^argosvix:\/\/alerts\/([A-Za-z0-9-]{1,64})$/;
 
-// 2026-05-31 = Phase 3 traces/{id} resource template (= backend GET /v1/query/trace/:id
-// 新設 endpoint を 経由、 1 trace = 複数 spans の全体像を URI 経由で context に carry)。
-// 大量 spans (= LLM context budget 観点で 50+ は重い) は MAX_TRACE_SPANS で 上限 carry。
+// traces/{id} resource template (via the backend GET /v1/query/trace/:id
+// endpoint; brings the full picture of one trace = multiple spans into context
+// via a URI). Large span counts (50+ is heavy for the LLM context budget) are
+// capped by MAX_TRACE_SPANS.
 const TRACES_TEMPLATE_URI = "argosvix://traces/{id}";
 const TRACE_URI_PATTERN = /^argosvix:\/\/traces\/([A-Za-z0-9_-]{1,128})$/;
 
-// 2026-06-02 = v1.5 annotations/{id} resource template (= backend GET /v1/annotations/:id
-// 経由、 1 annotation の review 詳細を URI 経由で context に carry)。 annotation は
-// AUTOINCREMENT integer id (= [1-9]\d{0,9})、 自 account scope は backend WHERE 句で
-// 構造防御。 sensitive な PII はないが、 annotation_text に user-controlled string が
-// 含まれるので sanitizeText 経由で carry する。
+// annotations/{id} resource template (via backend GET /v1/annotations/:id;
+// brings one annotation's review detail into context via a URI). Annotations
+// use an AUTOINCREMENT integer id ([1-9]\d{0,9}); own-account scoping is
+// structurally enforced by the backend WHERE clause. No sensitive PII, but
+// annotation_text contains user-controlled strings, so it goes through
+// sanitizeText.
 const ANNOTATIONS_TEMPLATE_URI = "argosvix://annotations/{id}";
 const ANNOTATION_URI_PATTERN = /^argosvix:\/\/annotations\/([1-9]\d{0,9})$/;
 
-// 2026-06-02 = v1.5 eval-criteria/{id} resource template (= backend GET /v1/eval-criteria/:id
-// 経由、 1 criterion の rubric を URI 経由で context に carry)。 LLM-as-judge runner の
-// instruction text に直接使える、 AI agent が「どんな軸で評価できるか」を 自動的に context
-// に取り込める軸。 global default (= accountId NULL) + 自 account custom 両方 visible、
-// 他 account の custom は 構造防御で 404。 rubric は user-controlled string で sanitizeText
-// 経由 carry (= prompt 経路の boundary 強化)。
+// eval-criteria/{id} resource template (via backend GET /v1/eval-criteria/:id;
+// brings one criterion's rubric into context via a URI). Directly usable as
+// the LLM-as-judge runner's instruction text, letting an AI agent
+// automatically learn "what axes can I evaluate on". Both global defaults
+// (accountId NULL) and the account's own custom criteria are visible; other
+// accounts' custom criteria return 404 by structural defense. The rubric is a
+// user-controlled string and goes through sanitizeText (hardening the prompt
+// path boundary).
 const EVAL_CRITERIA_TEMPLATE_URI = "argosvix://eval-criteria/{id}";
 const EVAL_CRITERION_URI_PATTERN = /^argosvix:\/\/eval-criteria\/([1-9]\d{0,9})$/;
 
-// 2026-06-02 = v1.5 Round F prompts/{id} resource template (= backend GET /v1/prompts/:id
-// 経由、 user が登録した prompt template を URI 経由で context に carry)。 AI agent が
-// 「production 版 customer support の prompt は こう」 という context を 自動で取り込む。
-// 自 account scope は backend WHERE 句で 構造防御。 template は user-controlled なので
-// sanitizeText 経由で carry (= 50000 char cap、 prompt injection 経路 構造防御)。
+// prompts/{id} resource template (via backend GET /v1/prompts/:id; brings a
+// user-registered prompt template into context via a URI). Lets an AI agent
+// automatically pick up context like "this is the production customer-support
+// prompt". Own-account scoping is structurally enforced by the backend WHERE
+// clause. The template is user-controlled, so it goes through sanitizeText
+// (50000 char cap; structural defense of the prompt injection path).
 const PROMPTS_TEMPLATE_URI = "argosvix://prompts/{id}";
 const PROMPT_URI_PATTERN = /^argosvix:\/\/prompts\/([1-9]\d{0,9})$/;
 
-// 2026-06-02 v1.5 closure = safety-assessments/{id} resource template (= backend
-// GET /v1/safety-assessments/:id 経由、 OpenAI Moderation cron が書き込んだ
-// 単一 assessment を URI 経由で context に carry)。 labels (= flagged
-// category 配列) + score + reasoning + classifier_id が含まれるため、 AI agent
-// は 「この call は どの policy 軸で flag された?」 を 1 fetch で把握できる。
-// 自 account scope は backend WHERE 句で 構造防御。
+// safety-assessments/{id} resource template (via backend
+// GET /v1/safety-assessments/:id; brings a single assessment written by the
+// OpenAI Moderation cron into context via a URI). Includes labels (array of
+// flagged categories) + score + reasoning + classifier_id, so an AI agent can
+// grasp "which policy axes flagged this call?" in one fetch. Own-account
+// scoping is structurally enforced by the backend WHERE clause.
 const SAFETY_ASSESSMENT_TEMPLATE_URI = "argosvix://safety-assessments/{id}";
 const SAFETY_ASSESSMENT_URI_PATTERN = /^argosvix:\/\/safety-assessments\/([1-9]\d{0,9})$/;
 
-// 2026-06-02 v1.5 closure = eval-runs/{id} resource template (= backend GET
-// /v1/eval-runs/:id 経由、 1 eval run の summary + scores 一覧を URI 経由で
-// carry)。 AI agent は 「直近の eval run の score 分布」 や 「criterion 別の
-// 平均」 を 1 fetch で把握できる。 自 account scope は backend WHERE 句で
-// 構造防御。 scores の reasoning (= judge LLM 出力) は sanitizeText で carry。
+// eval-runs/{id} resource template (via backend GET /v1/eval-runs/:id; brings
+// one eval run's summary + score list into context via a URI). An AI agent can
+// grasp "the score distribution of the latest eval run" or "per-criterion
+// averages" in one fetch. Own-account scoping is structurally enforced by the
+// backend WHERE clause. Score reasoning (judge LLM output) goes through
+// sanitizeText.
 const EVAL_RUN_TEMPLATE_URI = "argosvix://eval-runs/{id}";
 const EVAL_RUN_URI_PATTERN = /^argosvix:\/\/eval-runs\/([1-9]\d{0,9})$/;
 
@@ -126,9 +134,10 @@ export const resources: Resource[] = [
   },
 ];
 
-// 2026-05-31 = Phase 3 resource template list。 client が template の {id} を 置換した
-// URI で resources/read を 呼ぶ flow。 自 account scope は backend PK (account_id, id)
-// で 構造防御済 (= 他 account の id を 試行的に組んでも 404)。
+// Resource template list. The client calls resources/read with a URI where the
+// template's {id} has been substituted. Own-account scoping is structurally
+// enforced by the backend PK (account_id, id) — probing another account's id
+// yields 404.
 export const resourceTemplates: ResourceTemplate[] = [
   {
     uriTemplate: CALLS_TEMPLATE_URI,
@@ -256,9 +265,9 @@ export async function readResource(
 ): Promise<{ contents: ResourceContentText[] }> {
   const { uri, apiKey, apiBase } = input;
 
-  // resource template (= argosvix://calls/{id} / argosvix://alerts/{id}) を switch 前に
-  // 先 match。 switch の case で dynamic expression を 評価する path は TS / readability
-  // で 望ましくないため、 template 系は ここで 早期 dispatch する。
+  // Match resource templates (argosvix://calls/{id} / argosvix://alerts/{id})
+  // before the switch. Evaluating dynamic expressions in switch cases is
+  // undesirable for TS and readability, so templates are dispatched early here.
   const callMatch = CALL_URI_PATTERN.exec(uri);
   if (callMatch) {
     const callId = callMatch[1]!;
@@ -268,16 +277,18 @@ export async function readResource(
       apiKey,
       { method: "GET" },
     );
-    // Codex v0.7.0 HIGH 1 fix: assertCallShape (= shape gate) だけでは backend response
-    // の raw JSON を そのまま LLM に流すので、 user-controlled JSON (= errorDetails /
-    // requestMeta) や 将来 backend 追加 field が prompt-injection 経路に carry される
-    // risk が残る。 projectCallForMcp で 明示的 allowlist 経由に carry。
+    // The shape gate (assertCallShape) alone would still stream the backend
+    // response's raw JSON to the LLM, leaving a risk that user-controlled JSON
+    // (errorDetails / requestMeta) or future backend fields flow into the
+    // prompt-injection path. projectCallForMcp routes it through an explicit
+    // allowlist instead.
     const projected = projectCallForMcp(json);
     return wrapJsonContent(uri, projected);
   }
-  // audit round2 fix = alerts/{id} template は "active" も captureしてしまうため、
-  // 完全一致の ALERTS_ACTIVE_URI (= list) を template より優先して除外する。 これが無いと
-  // alerts/active が id="active" の単体 fetch に misroute され list resource が壊れる。
+  // The alerts/{id} template would also capture "active", so the exact-match
+  // ALERTS_ACTIVE_URI (the list) is excluded before the template. Without this,
+  // alerts/active gets misrouted to a single fetch with id="active", breaking
+  // the list resource.
   const alertMatch =
     uri === ALERTS_ACTIVE_URI ? null : ALERT_URI_PATTERN.exec(uri);
   if (alertMatch) {
@@ -288,8 +299,9 @@ export async function readResource(
       apiKey,
       { method: "GET" },
     );
-    // Codex v0.7.0 HIGH 1 fix と 同 pattern = projection allowlist で channelTargets
-    // (= 通知先 = sensitive) と accountId (= internal) を 構造的に drop する。
+    // Same pattern as the call projection: the projection allowlist
+    // structurally drops channelTargets (notification destinations =
+    // sensitive) and accountId (internal).
     const projected = projectAlertForMcp(json);
     return wrapJsonContent(uri, projected);
   }
@@ -302,7 +314,8 @@ export async function readResource(
       apiKey,
       { method: "GET" },
     );
-    // spans cap + per-span allowlist で context 膨張 / sensitive 漏洩 構造防御
+    // Span cap + per-span allowlist structurally defend against context bloat
+    // and leaking sensitive data.
     const projected = projectTraceForMcp(json);
     return wrapJsonContent(uri, projected);
   }
@@ -315,8 +328,9 @@ export async function readResource(
       apiKey,
       { method: "GET" },
     );
-    // annotationText (= user-controlled) は sanitizeText 経由で carry、 PII / prompt
-    // injection 経路を 構造防御。 createdByUserId (= internal sub) は drop。
+    // annotationText (user-controlled) goes through sanitizeText, structurally
+    // defending the PII / prompt-injection path. createdByUserId (internal
+    // sub) is dropped.
     const projected = projectAnnotationForMcp(json);
     return wrapJsonContent(uri, projected);
   }
@@ -329,9 +343,10 @@ export async function readResource(
       apiKey,
       { method: "GET" },
     );
-    // rubric (= user-controlled judge instruction) は sanitizeText 経由で carry、
-    // accountId は projection drop (= internal scope、 ただし null/string で plan
-    // 軸の narrative 軸あり、 dashboard は表示するが MCP context には不要)。
+    // The rubric (user-controlled judge instruction) goes through sanitizeText.
+    // accountId is dropped by the projection (internal scope; its null/string
+    // value does convey plan-related meaning and the dashboard shows it, but
+    // it is unnecessary in MCP context).
     const projected = projectCriterionForMcp(json);
     return wrapJsonContent(uri, projected);
   }
@@ -344,8 +359,9 @@ export async function readResource(
       apiKey,
       { method: "GET" },
     );
-    // template (= user-controlled prompt text) は sanitizeText 経由で carry、
-    // accountId / createdByUserId は projection drop (= internal scope)。
+    // The template (user-controlled prompt text) goes through sanitizeText;
+    // accountId / createdByUserId are dropped by the projection (internal
+    // scope).
     const projected = projectPromptForMcp(json);
     return wrapJsonContent(uri, projected);
   }
@@ -379,10 +395,12 @@ export async function readResource(
       const json = await fetchJson(apiBase, "/v1/account", apiKey, {
         method: "GET",
       });
-      // Codex v0.5.0 MEDIUM 2 fix: account response の shape を fail-closed 検証する。
-      // alerts/active と同様、 backend が将来 accidental に PII 等の field を 追加した
-      // 場合に 「non-sensitive」 前提が崩れたまま LLM に流れる risk を 構造防御する。
-      // 期待外 shape は throw → ResourceNotFoundError ではなく InternalError に carry。
+      // Fail-closed validation of the account response shape. As with
+      // alerts/active, this structurally defends against the risk that the
+      // backend accidentally adds a field (e.g. PII) in the future and it
+      // flows to the LLM while the "non-sensitive" assumption no longer holds.
+      // Unexpected shapes throw, surfacing as InternalError rather than
+      // ResourceNotFoundError.
       assertAccountShape(json);
       return wrapJsonContent(uri, json);
     }
@@ -394,8 +412,8 @@ export async function readResource(
       return wrapJsonContent(uri, filtered);
     }
     case COST_TODAY_URI: {
-      // backend `/v1/query/aggregate` は POST 専用 + ISO range body。 0.3.1-alpha.1
-      // の tools.ts と同経路を carry。 直近 24h を 今 から逆算する。
+      // The backend `/v1/query/aggregate` is POST-only with an ISO range body.
+      // Uses the same path as tools.ts. The last 24h are computed back from now.
       const now = Date.now();
       const start = new Date(now - 24 * 3600 * 1000).toISOString();
       const end = new Date(now).toISOString();
@@ -453,10 +471,11 @@ async function fetchJson(
   }
   const res = await fetch(url.toString(), init);
   if (!res.ok) {
-    // Codex v0.4.0 HIGH 1 fix: backend error body を LLM に直接 expose しない。
-    // 内部識別子 / PII / 内部実装 message を含む path を 構造防御。 詳細 debug が必要なら
-    // server stderr に raw body を log (= operator 限定)、 client には status + path
-    // のみ返す。 x-request-id があれば 突合用に carry。
+    // Never expose the backend error body directly to the LLM: it can contain
+    // internal identifiers / PII / internal implementation messages. When
+    // detailed debugging is needed, the raw body is logged to the server's
+    // stderr (operator only); the client only gets status + path. If
+    // x-request-id is present it is included for correlation.
     const rawBody = await res.text().catch(() => "");
     const requestId = res.headers.get("x-request-id") ?? undefined;
     // eslint-disable-next-line no-console
@@ -474,14 +493,15 @@ async function fetchJson(
 }
 
 /**
- * Codex v0.5.0 MEDIUM 2 fix: /v1/account response shape の fail-closed 検証。
- * backend が 想定外 field を 追加した時に LLM が 「non-sensitive」 前提で context に
- * 取り込んでしまう risk を 構造防御する。 期待外なら throw。
+ * Fail-closed validation of the /v1/account response shape. Structurally
+ * defends against the risk that the LLM ingests unexpected backend fields into
+ * context under the "non-sensitive" assumption. Throws on anything unexpected.
  *
- * 「allowlist 検証」 方式 = 期待 field 以外が混入していても通すが、 必須 field の
- * 型 / 存在 が崩れたら fail-closed する。 backend 側で additive な field 追加自体は
- * 互換維持で OK (= MCP server を更新せず backend だけ rolling deploy する 運用)、
- * ただし 必須 field の 形式 drift は 即検出 する 軸。
+ * This is allowlist-style validation: extra fields beyond the expected ones
+ * pass through, but if a required field's type or presence breaks, it fails
+ * closed. Additive backend fields remain compatible (supporting the operation
+ * of rolling-deploying only the backend without updating the MCP server),
+ * while format drift in required fields is detected immediately.
  */
 export function assertAccountShape(raw: unknown): void {
   if (typeof raw !== "object" || raw === null) {
@@ -513,13 +533,14 @@ export function assertAccountShape(raw: unknown): void {
       "unexpected /v1/account.account.retentionDays (expected number)",
     );
   }
-  // Codex v0.5.0 round 2 MEDIUM 1 fix + round 3 LOW 1 fix: createdAt は必須 field
-  // 且つ 「ISO 8601 相当の文字列 or null」 限定で gate する。
-  //   - 欠落 → throw
-  //   - null → 通る (= backend toIsoOrNull の Date.parse failure 時 null fallback と整合)
-  //   - 空文字 / Date.parse 不能文字列 / 非 string → throw
-  // backend で normalize 済の前提だが、 別 backend 経路 や 将来の drift で 不正値が来た
-  // 時に LLM が 「invalid date」 を context に取り込むのを 構造防御。
+  // createdAt is a required field, gated to "an ISO 8601-like string or null":
+  //   - missing → throw
+  //   - null → passes (consistent with the backend's toIsoOrNull null fallback
+  //     on Date.parse failure)
+  //   - empty string / un-parseable string / non-string → throw
+  // The backend is assumed to normalize this, but if an invalid value arrives
+  // via another backend path or future drift, this structurally prevents the
+  // LLM from taking an "invalid date" into context.
   if (!("createdAt" in a)) {
     throw new Error(
       "unexpected /v1/account.account.createdAt (missing required field)",
@@ -559,10 +580,11 @@ export function assertAccountShape(raw: unknown): void {
 }
 
 /**
- * Codex v0.5.0 MEDIUM 2 fix と 同じ fail-closed pattern (= /v1/query/calls/:id 用)。
- * backend response は `{ call: { id, provider, model, ... } }` shape。 必須 field の型
- * + 存在を gate、 違反は throw → McpError.InternalError に carry。 additive field 追加は
- * そのまま通す (= rolling deploy 互換)。
+ * Same fail-closed pattern as assertAccountShape, for /v1/query/calls/:id.
+ * The backend response has the shape `{ call: { id, provider, model, ... } }`.
+ * Gates the type and presence of required fields; violations throw and surface
+ * as McpError.InternalError. Additive fields pass through (rolling-deploy
+ * compatible).
  */
 export function assertCallShape(raw: unknown): void {
   if (typeof raw !== "object" || raw === null) {
@@ -610,17 +632,20 @@ export function assertCallShape(raw: unknown): void {
 }
 
 /**
- * Codex v0.7.0 HIGH 1 fix: backend response の raw JSON pass-through を 廃止し、 LLM
- * context に 流す field を 明示 allowlist で carry する。 user-controlled JSON 部分 (=
- * errorDetails / requestMeta = 内部 stack trace / debug-only field) を drop し、 prompt
- * injection 経路 と 内部実装 漏洩 risk を 構造防御する。
+ * Replaces raw JSON pass-through of the backend response with an explicit
+ * allowlist of fields that flow into LLM context. Drops the user-controlled
+ * JSON parts (errorDetails / requestMeta = internal stack traces / debug-only
+ * fields), structurally defending against prompt injection and internal
+ * implementation leakage.
  *
- * 含める: id / provider / model / timestamp + token / cost / latency 数値群 + tags (=
- * LLM が分析に使う、 ただし PII は terms §4 で user 投入禁止)、 error + trace ID 群
- * (= debug agent + trace navigation 用途)。
+ * Included: id / provider / model / timestamp, the token / cost / latency
+ * numerics, tags (used by the LLM for analysis; note the terms of service
+ * prohibit users from putting PII in tags), and the error + trace ID group
+ * (for debug agents and trace navigation).
  *
- * 含めない (= drop): errorDetails (= 内部 stack trace)、 requestMeta (= internal
- * implementation detail)、 将来 backend が追加した unknown field。
+ * Excluded (dropped): errorDetails (internal stack trace), requestMeta
+ * (internal implementation detail), and any unknown fields the backend adds in
+ * the future.
  */
 function projectCallForMcp(raw: unknown): unknown {
   assertCallShape(raw);
@@ -634,24 +659,27 @@ function projectCallForMcp(raw: unknown): unknown {
     costUsd: c["costUsd"],
     latencyMs: c["latencyMs"],
   };
-  // optional 数値 / object / string 型 field は 存在 + 期待型 を 個別 check して carry。
+  // Optional number / object / string fields are individually checked for
+  // presence and expected type before being carried over.
   if (typeof c["promptTokens"] === "number") projected["promptTokens"] = c["promptTokens"];
   if (typeof c["completionTokens"] === "number") {
     projected["completionTokens"] = c["completionTokens"];
   }
-  // tags は user-defined Record<string, string|number|boolean> = LLM 分析用に carry、
-  // ただし PII を 含めるのは Terms §4 違反 で user 責任 (= 既存 narrative carry)。
-  // Codex v0.7.0 round 2 LOW 1 fix: prompt surface boundary を 強化、 入れ子 / 配列 /
-  // 巨大 string / 制御文字 を sanitizeTags で 構造防御 (= MCP prompt context への
-  // 想定外データ流入を 最小化)。
+  // tags is a user-defined Record<string, string|number|boolean> carried for
+  // LLM analysis; including PII in tags violates the Terms of Service and is
+  // the user's responsibility. The prompt surface boundary is hardened:
+  // sanitizeTags structurally defends against nested objects / arrays / huge
+  // strings / control characters, minimizing unexpected data flowing into MCP
+  // prompt context.
   const sanitized = sanitizeTags(c["tags"]);
   if (sanitized !== undefined) projected["tags"] = sanitized;
-  // error は string | null (= summary message)、 errorDetails (= stack trace / internal)
-  // は drop。
+  // error is string | null (a summary message); errorDetails (stack trace /
+  // internal) is dropped.
   if (typeof c["error"] === "string" || c["error"] === null) {
     projected["error"] = c["error"];
   }
-  // trace navigation 用 ID 群 (= 別 resource template / dashboard jump 経路で 価値あり)
+  // Trace-navigation ID group (valuable for other resource templates and
+  // dashboard jump paths).
   if (typeof c["traceId"] === "string" || c["traceId"] === null) {
     projected["traceId"] = c["traceId"];
   }
@@ -665,10 +693,11 @@ function projectCallForMcp(raw: unknown): unknown {
 }
 
 /**
- * v0.8.0 = alerts/{id} resource template の shape gate。 backend response は
- * `{ alert: {...}, events: [...] }` shape (= /v1/alerts/:id)。 必須 field の型 + 存在を
- * fail-closed で gate、 違反は throw → McpError.InternalError に carry。 events array
- * の各 entry も object check のみで、 中身 field は project 側で carry。
+ * Shape gate for the alerts/{id} resource template. The backend response has
+ * the `{ alert: {...}, events: [...] }` shape (/v1/alerts/:id). Gates required
+ * fields' type and presence fail-closed; violations throw and surface as
+ * McpError.InternalError. Each events entry is only object-checked here; its
+ * inner fields are handled on the projection side.
  */
 export function assertAlertShape(raw: unknown): void {
   if (typeof raw !== "object" || raw === null) {
@@ -700,8 +729,8 @@ export function assertAlertShape(raw: unknown): void {
       "unexpected /v1/alerts/:id alert.enabled (expected boolean)",
     );
   }
-  // Codex v0.8.0 LOW 4 fix = optional 数値 field の 型ドリフト 検知 (= 存在時のみ型 check、
-  // 不在は OK、 型違反は throw)。
+  // Type-drift detection for optional numeric fields (type-checked only when
+  // present; absence is OK, type violations throw).
   if ("thresholdValue" in a && typeof a["thresholdValue"] !== "number") {
     throw new Error(
       "unexpected /v1/alerts/:id alert.thresholdValue (expected number)",
@@ -712,7 +741,7 @@ export function assertAlertShape(raw: unknown): void {
       "unexpected /v1/alerts/:id alert.windowMinutes (expected number)",
     );
   }
-  // events は array required、 中身 element の shape は project 側で carry。
+  // events must be an array; element shapes are handled on the projection side.
   const events = obj["events"];
   if (!Array.isArray(events)) {
     throw new Error(
@@ -722,27 +751,31 @@ export function assertAlertShape(raw: unknown): void {
 }
 
 /**
- * v0.8.0 = alerts/{id} projection allowlist。 backend が返す sensitive field
- * (= channelTargets = 通知先 email / webhook URL、 accountId = internal scope) を
- * 構造的に drop し、 LLM context に carry する field を 明示制限する。
- *   - alert: id / name / alertType / thresholdValue / windowMinutes / filterProvider /
- *     filterModel / channelKinds / sleepMinutes / enabled / createdAt / updatedAt /
- *     silencedUntil
- *   - events: id / triggeredAt / observedValue / channelsSent + (将来 ack carry 時) ack
- * channelKinds は文字列 array (= ChannelKind enum)、 channelTargets は drop。
+ * Projection allowlist for alerts/{id}. Structurally drops the sensitive
+ * fields the backend returns (channelTargets = notification email / webhook
+ * URLs, accountId = internal scope) and explicitly restricts what is carried
+ * into LLM context.
+ *   - alert: id / name / alertType / thresholdValue / windowMinutes /
+ *     filterProvider / filterModel / channelKinds / sleepMinutes / enabled /
+ *     createdAt / updatedAt / silencedUntil
+ *   - events: id / triggeredAt / observedValue / channelsSent (+ ack if that
+ *     ever gets added)
+ * channelKinds is a string array (the ChannelKind enum); channelTargets is
+ * dropped.
  */
-// Codex v0.8.0 MEDIUM 1 fix = events 件数 cap で context 膨張 / DoS 防御。 backend が
-// LIMIT 20 で 返す前提だが、 仕様 drift / 試験 endpoint で 大量 返却された場合に
-// MCP 側でも cap する。
+// Cap on event count to defend against context bloat / DoS. The backend is
+// expected to return LIMIT 20, but the MCP side caps too in case of spec
+// drift or an experimental endpoint returning a large batch.
 const MAX_ALERT_EVENTS = 20;
 
-// Codex v0.8.0 MEDIUM 3 fix = channel 種別を 既知 enum に limit (= 不明文字列が prompt
-// に carry される path を 構造防御)。 backend `ChannelKind` enum と 同期。
-// Codex v0.8.0 round 2 LOW 1 fix = export 化して resources.test.ts の drift gate test で
-// backend CHANNEL_KINDS と 完全一致を CI で gate (= backend で 新 kind 追加された時に
-// MCP server が 静かに drop する 機能劣化 を 構造防御)。
-// Codex v1.5 round 6 MEDIUM 2 fix = "pagerduty" を 追加 (= 2026-05-31 PagerDuty
-// channel ship に伴う drift)。
+// Limits channel kinds to the known enum (structurally defending the path
+// where unknown strings get carried into the prompt). Kept in sync with the
+// backend `ChannelKind` enum.
+// Exported so the drift-gate test in resources.test.ts can verify an exact
+// match with the backend CHANNEL_KINDS in CI (structural defense against the
+// silent-degradation case where the backend adds a new kind and the MCP
+// server quietly drops it).
+// "pagerduty" was added when the PagerDuty channel shipped.
 export const ALLOWED_CHANNEL_KINDS = new Set<string>([
   "email",
   "slack",
@@ -753,10 +786,10 @@ export const ALLOWED_CHANNEL_KINDS = new Set<string>([
 ]);
 
 /**
- * 2026-05-31 Codex v1.5 round 6 MEDIUM 2 fix = channels_sent に carry される plan
- * skip sentinel。 backend types.ts SKIPPED_BY_PLAN_SENTINEL と同期 (= drift gate
- * test で CI carry)。 filterChannelKinds で sentinel も pass-through、 MCP client
- * (= AI agent) が 「plan で skip された event」 を 正確に観測できる軸。
+ * Plan-skip sentinel carried in channels_sent. Kept in sync with
+ * SKIPPED_BY_PLAN_SENTINEL in the backend's types.ts (guarded by a drift-gate
+ * test in CI). filterChannelKinds passes the sentinel through, so the MCP
+ * client (AI agent) can accurately observe "events skipped due to plan".
  */
 export const SKIPPED_BY_PLAN_SENTINEL = "__skipped_by_plan__";
 
@@ -768,24 +801,25 @@ function filterChannelKinds(xs: unknown[]): string[] {
   );
 }
 
-// Codex v0.8.0 MEDIUM 2 fix = alert.name の prompt injection 経路を 防御 (= 制御文字
-// strip + 100 字 cap)。 backend create_alert で 既に name pattern `^[^\r\n]{1,100}$`
-// で gate 済だが、 MCP 側でも boundary を carry (= 過去 row や 別 path で 入った値の
-// 防御)。
+// Defends the alert.name prompt-injection path (control-character strip +
+// 100-char cap). The backend's create_alert already gates the name with the
+// pattern `^[^\r\n]{1,100}$`, but the MCP side keeps its own boundary too
+// (protecting against values from old rows or other write paths).
 const MAX_ALERT_NAME_LENGTH = 100;
 function sanitizeAlertName(v: unknown): string | undefined {
-  // v0.9.1 = sanitizeText 経由に carry で 共通化 (= Codex v0.9.0 round 2 INFO 2)。 
-  // sanitizeText は null は null を 返すが、 alert.name は null 想定なし
-  // (= 受け取らない場合 string 型 違反として undefined drop) なので そのまま carry。
+  // Shares the implementation via sanitizeText. sanitizeText returns null for
+  // null, but alert.name is never expected to be null (a non-string is
+  // dropped as undefined = string-type violation), so the result is used as-is.
   const result = sanitizeText(v, MAX_ALERT_NAME_LENGTH);
   return typeof result === "string" ? result : undefined;
 }
 
 /**
- * 単一 alert object を allowlist projection する共有 helper。
- * ⚠ channelTargets (= webhook URL/secret/PagerDuty key/email) と accountId は
- * 意図的に drop する (= LLM context への secret/PII 漏洩防止)。 list / detail の
- * 両 path がこの 1 箇所を通ることで raw passthrough を構造排除する (audit round2 SHIP_BLOCKER fix)。
+ * Shared helper that allowlist-projects a single alert object.
+ * WARNING: channelTargets (webhook URL / secret / PagerDuty key / email) and
+ * accountId are dropped deliberately (prevents leaking secrets / PII into LLM
+ * context). Both the list and detail paths go through this single place,
+ * structurally eliminating raw passthrough.
  */
 function projectAlertObject(a: Record<string, unknown>): Record<string, unknown> {
   const projAlert: Record<string, unknown> = {
@@ -793,8 +827,9 @@ function projectAlertObject(a: Record<string, unknown>): Record<string, unknown>
     alertType: a["alertType"],
     enabled: a["enabled"],
   };
-  // Codex v0.8.0 MEDIUM 2 fix = name は sanitize 経由で carry。 sanitize 結果が空文字
-  // (= 全部 制御文字) なら shape gate 違反扱いで throw (= 表示用 name が必須)。
+  // name goes through sanitization. If the sanitized result is empty (all
+  // control characters), treat it as a shape-gate violation and throw (a
+  // display name is required).
   const safeName = sanitizeAlertName(a["name"]);
   if (safeName === undefined || safeName.length === 0) {
     throw new Error(
@@ -802,7 +837,7 @@ function projectAlertObject(a: Record<string, unknown>): Record<string, unknown>
     );
   }
   projAlert["name"] = safeName;
-  // optional 数値 / string / array field を 個別 carry。
+  // Optional number / string / array fields are carried over individually.
   if (typeof a["thresholdValue"] === "number") {
     projAlert["thresholdValue"] = a["thresholdValue"];
   }
@@ -819,7 +854,7 @@ function projectAlertObject(a: Record<string, unknown>): Record<string, unknown>
     projAlert["filterModel"] = a["filterModel"];
   }
   if (Array.isArray(a["channelKinds"])) {
-    // Codex v0.8.0 MEDIUM 3 fix = ChannelKind enum 集合 のみ accept (= 不明文字列 drop)
+    // Only the ChannelKind enum set is accepted (unknown strings are dropped).
     projAlert["channelKinds"] = filterChannelKinds(a["channelKinds"] as unknown[]);
   }
   if (typeof a["createdAt"] === "string") projAlert["createdAt"] = a["createdAt"];
@@ -835,8 +870,8 @@ function projectAlertForMcp(raw: unknown): unknown {
   const obj = raw as { alert: Record<string, unknown>; events: unknown[] };
   const a = obj.alert;
   const projAlert = projectAlertObject(a);
-  // events も 個別 projection。 Codex v0.8.0 MEDIUM 1 fix = MAX_ALERT_EVENTS cap、
-  // MEDIUM 3 fix = channelsSent も enum allowlist 経由。
+  // Events are projected individually too: capped at MAX_ALERT_EVENTS, and
+  // channelsSent also goes through the enum allowlist.
   const projEvents = (obj.events as unknown[])
     .slice(0, MAX_ALERT_EVENTS)
     .filter((e): e is Record<string, unknown> => typeof e === "object" && e !== null)
@@ -856,9 +891,10 @@ function projectAlertForMcp(raw: unknown): unknown {
 }
 
 /**
- * v0.9.0 = traces/{id} resource template の shape gate。 backend response shape は
- * `{ trace: { id: string, spans: [...] } }`。 spans 配列 は object 内 必須 field check
- * のみ、 中身 field projection は projectTraceForMcp 側で carry。
+ * Shape gate for the traces/{id} resource template. The backend response shape
+ * is `{ trace: { id: string, spans: [...] } }`. Only the required fields
+ * around the spans array are checked here; per-field projection happens in
+ * projectTraceForMcp.
  */
 export function assertTraceShape(raw: unknown): void {
   if (typeof raw !== "object" || raw === null) {
@@ -887,26 +923,30 @@ export function assertTraceShape(raw: unknown): void {
 }
 
 /**
- * v0.9.0 = traces/{id} projection allowlist。 spans 上位 50 件で cap + 各 span は
- * allowlist 経由 carry (= errorDetails / requestMeta = 内部 debug 情報 drop、 tags は
- * sanitizeTags 経由、 error は sanitizeText 経由)。 backend は LIMIT 500 だが LLM
- * context budget で 50 cap が妥当。 response shape の meta で 元 spans 件数と
- * truncated フラグを 返却し、 user が cap 影響を 検知可能。
+ * Projection allowlist for traces/{id}. Spans are capped at the top 50, and
+ * each span goes through an allowlist (errorDetails / requestMeta = internal
+ * debug info are dropped; tags via sanitizeTags, error via sanitizeText). The
+ * backend uses LIMIT 500, but a 50 cap is appropriate for the LLM context
+ * budget. The response's meta returns the original span count and a truncated
+ * flag so the user can detect the cap's effect.
  *
- * Codex v0.9.0 fix:
- *   - HIGH 1: error 文字列を sanitizeText (= 512 字 cap + 制御文字 strip) で sanitize
- *   - MEDIUM 2: meta.originalSpans / returnedSpans / truncated で silent truncate 解消
- *   - MEDIUM 3: filter → slice 順序 carry で 異常要素先頭時の過剰 drop 回避
+ * Hardening notes:
+ *   - error strings are sanitized via sanitizeText (512-char cap +
+ *     control-character strip)
+ *   - meta.originalSpans / returnedSpans / truncated eliminate silent truncation
+ *   - filter-then-slice ordering avoids over-dropping when malformed elements
+ *     appear first
  */
 const MAX_TRACE_SPANS = 50;
 const MAX_ERROR_TEXT_LENGTH = 512;
 
 /**
- * v0.9.1 = sanitizeText を export 化 + 直接 unit test 化 (= Codex v0.9.0 round 2 LOW 1
- * carry)。 既往 traces/{id} の error field + 将来追加の text field で 同 pattern carry。
- *   - null は null carry (= 「明示的 不在」 semantic を 維持)
- *   - string は maxLength で slice + 制御文字 (= U+0000 から U+001F + U+007F) を strip
- *   - 非 string は undefined drop
+ * sanitizeText is exported and unit-tested directly. Used for the traces/{id}
+ * error field and for any future text fields following the same pattern.
+ *   - null passes through as null (preserving the "explicitly absent" semantic)
+ *   - strings are sliced to maxLength and control characters (U+0000 through
+ *     U+001F plus U+007F) are stripped
+ *   - non-strings are dropped as undefined
  */
 export function sanitizeText(
   input: unknown,
@@ -922,9 +962,9 @@ function projectTraceForMcp(raw: unknown): unknown {
   const obj = raw as {
     trace: { id: string; spans: unknown[] };
   };
-  // Codex MEDIUM 3 fix = filter 先で 異常要素 (= primitive / null) を 落とした後、
-  // slice で valid spans の 上位 N 件を carry (= 異常要素先頭時に 有効 spans が
-  // 過剰 drop される path を 構造防御)。
+  // Filter first to drop malformed elements (primitives / null), then slice
+  // to take the top N valid spans. This structurally prevents valid spans from
+  // being over-dropped when malformed elements appear first.
   const validSpans = obj.trace.spans.filter(
     (s): s is Record<string, unknown> => typeof s === "object" && s !== null,
   );
@@ -941,9 +981,10 @@ function projectTraceForMcp(raw: unknown): unknown {
     }
     if (typeof s["costUsd"] === "number") out["costUsd"] = s["costUsd"];
     if (typeof s["latencyMs"] === "number") out["latencyMs"] = s["latencyMs"];
-    // Codex HIGH 1 fix = error も sanitizeText (= 512 字 cap + 制御文字 strip) 経由で
-    // carry (= provider 由来の長文 error / 誘導文 が LLM context に 無制限 carry される
-    // path を 構造防御、 50 spans 増幅で context DoS を 起こさない)。
+    // error also goes through sanitizeText (512-char cap + control-character
+    // strip), structurally preventing long provider-originated errors or
+    // injected instructions from flowing unbounded into LLM context — and
+    // avoiding a context DoS when amplified across 50 spans.
     const errSan = sanitizeText(s["error"], MAX_ERROR_TEXT_LENGTH);
     if (errSan !== undefined) out["error"] = errSan;
     if (typeof s["spanId"] === "string" || s["spanId"] === null) {
@@ -954,11 +995,11 @@ function projectTraceForMcp(raw: unknown): unknown {
     }
     const tagsSan = sanitizeTags(s["tags"]);
     if (tagsSan !== undefined) out["tags"] = tagsSan;
-    // errorDetails / requestMeta は 構造 drop (= 内部 debug)
+    // errorDetails / requestMeta are structurally dropped (internal debug).
     return out;
   });
-  // Codex MEDIUM 2 fix = silent truncate 解消、 user が cap 影響を 検知できるよう meta
-  // で 元 spans 件数と truncated フラグを carry。
+  // No silent truncation: meta carries the original span count and a
+  // truncated flag so the user can detect the cap's effect.
   const originalSpansCount = obj.trace.spans.length;
   return {
     trace: { id: obj.trace.id, spans: projSpans },
@@ -971,17 +1012,19 @@ function projectTraceForMcp(raw: unknown): unknown {
 }
 
 /**
- * Codex v0.7.0 round 2 LOW 1 fix: tags の prompt surface boundary を 強化する。
- * SDK Terms §4 で user は tags に `Record<string, string|number|boolean>` のみ入れる
- * 規約だが、 不正 SDK / 直接 ingest で 入れ子 object / 配列 / 巨大 string / 制御文字 が
- * 紛れ込んだ場合に LLM context へ そのまま 流れる risk を 構造防御する。
+ * Hardens the prompt surface boundary for tags. The Terms of Service require
+ * users to put only `Record<string, string|number|boolean>` into tags, but if
+ * a non-conforming SDK or direct ingest sneaks in nested objects / arrays /
+ * huge strings / control characters, this structurally defends against them
+ * flowing straight into LLM context.
  *
- *   - 非 plain object (= null / array / 非 object) → undefined で 全 drop
- *   - key 長 1-64 文字 を 越える entry は drop
- *   - value = string (= 256 文字 cap + 制御文字 [\x00-\x1F\x7F] を strip) / number
- *     (= Number.isFinite のみ) / boolean のみ carry、 他は drop
+ *   - non-plain objects (null / array / non-object) → fully dropped as undefined
+ *   - entries whose key length is outside 1-64 characters are dropped
+ *   - values: only string (256-char cap + control characters [\x00-\x1F\x7F]
+ *     stripped) / number (Number.isFinite only) / boolean are carried; the
+ *     rest are dropped
  */
-// Codex v0.7.0 round 3 MEDIUM 1 fix = tags 件数 cap で context 膨張 / DoS 防御。
+// Cap on tag entry count to defend against context bloat / DoS.
 const MAX_TAG_ENTRIES = 128;
 
 export function sanitizeTags(
@@ -990,9 +1033,10 @@ export function sanitizeTags(
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     return undefined;
   }
-  // Codex v0.7.0 round 3 LOW 2 fix = strict plain object only (= Date / class instance
-  // / その他 prototype 持ち object を drop)。 null prototype (= Object.create(null))
-  // は ingest 経路で 来ない想定だが accept (= Object.entries iteration 安全)。
+  // Strict plain objects only (Date / class instances / other objects with a
+  // prototype are dropped). A null prototype (Object.create(null)) is not
+  // expected via the ingest path but is accepted (Object.entries iteration is
+  // safe).
   const proto = Object.getPrototypeOf(input);
   if (proto !== Object.prototype && proto !== null) {
     return undefined;
@@ -1003,7 +1047,7 @@ export function sanitizeTags(
     if (kept >= MAX_TAG_ENTRIES) break;
     if (k.length === 0 || k.length > 64) continue;
     if (typeof v === "string") {
-      // 制御文字 strip + 256 文字 cap (= LLM prompt injection mitigation)
+      // Control-character strip + 256-char cap (LLM prompt injection mitigation).
       out[k] = v.slice(0, 256).replace(/[\u0000-\u001F\u007F]/g, "");
       kept++;
     } else if (typeof v === "number" && Number.isFinite(v)) {
@@ -1013,18 +1057,20 @@ export function sanitizeTags(
       out[k] = v;
       kept++;
     }
-    // それ以外 (= 入れ子 object / 配列 / null / undefined / function 等) は drop
+    // Everything else (nested objects / arrays / null / undefined / functions
+    // etc.) is dropped.
   }
   return out;
 }
 
 /**
- * 2026-06-02 v1.5 = annotations/{id} resource template の shape gate + projection。
- * backend response shape は `{ annotation: { id, accountId, callId, createdByUserId,
- * annotationText, label, qualityScore, createdAt, updatedAt } }`。 必須 field の存在 +
- * 型 を fail-closed で gate、 違反は throw。 createdByUserId (= internal user sub) と
- * accountId (= internal scope) は projection で drop、 annotationText / label は
- * sanitizeText (= 制御文字 strip + 上限 cap) 経由で carry。
+ * Shape gate + projection for the annotations/{id} resource template. The
+ * backend response shape is `{ annotation: { id, accountId, callId,
+ * createdByUserId, annotationText, label, qualityScore, createdAt,
+ * updatedAt } }`. Required fields' presence and type are gated fail-closed;
+ * violations throw. createdByUserId (internal user sub) and accountId
+ * (internal scope) are dropped by the projection; annotationText / label go
+ * through sanitizeText (control-character strip + length cap).
  */
 const MAX_ANNOTATION_TEXT_LENGTH = 2000;
 const MAX_ANNOTATION_LABEL_LENGTH = 64;
@@ -1081,18 +1127,19 @@ function projectAnnotationForMcp(raw: unknown): unknown {
   if (typeof a["qualityScore"] === "number" || a["qualityScore"] === null) {
     projected["qualityScore"] = a["qualityScore"];
   }
-  // accountId / createdByUserId は projection drop (= internal scope)
+  // accountId / createdByUserId are dropped by the projection (internal scope).
   return { annotation: projected };
 }
 
 /**
- * 2026-06-02 v1.5 = eval-criteria/{id} resource template の shape gate + projection。
- * backend response shape は `{ criterion: { id, accountId, name, rubric, scaleMin,
- * scaleMax, createdAt, updatedAt } }`。 必須 field の存在 + 型 を fail-closed で gate、
- * 違反は throw。 accountId は projection で drop (= internal scope、 global default の
- * NULL / 自 account の string narrative は MCP context に不要)、 name / rubric は
- * sanitizeText 経由で carry。 rubric cap は 4000 字 (= judge instruction が長文 に
- * なり得る軸で annotation より大き目)。
+ * Shape gate + projection for the eval-criteria/{id} resource template. The
+ * backend response shape is `{ criterion: { id, accountId, name, rubric,
+ * scaleMin, scaleMax, createdAt, updatedAt } }`. Required fields' presence and
+ * type are gated fail-closed; violations throw. accountId is dropped by the
+ * projection (internal scope; the global-default NULL / own-account string
+ * distinction is unnecessary in MCP context). name / rubric go through
+ * sanitizeText. The rubric cap is 4000 chars (larger than annotations because
+ * judge instructions can be long).
  */
 const MAX_CRITERION_NAME_LENGTH = 100;
 const MAX_CRITERION_RUBRIC_LENGTH = 4000;
@@ -1152,19 +1199,22 @@ function projectCriterionForMcp(raw: unknown): unknown {
   if (rubricSan !== undefined) projected["rubric"] = rubricSan;
   if (typeof c["createdAt"] === "string") projected["createdAt"] = c["createdAt"];
   if (typeof c["updatedAt"] === "string") projected["updatedAt"] = c["updatedAt"];
-  // accountId は drop (= internal scope、 global default NULL / 自 account string の
-  // narrative は MCP context に carry しない、 LLM-as-judge 軸では rubric のみで充分)。
+  // accountId is dropped (internal scope; the global-default NULL /
+  // own-account string distinction is not carried into MCP context — the
+  // rubric alone suffices for LLM-as-judge use).
   return { criterion: projected };
 }
 
 /**
- * 2026-06-02 v1.5 Round F = prompts/{id} resource template の shape gate + projection。
- * backend response shape は `{ prompt: { id, accountId, name, version, template, variables,
- * labels, description, createdByUserId, createdAt, updatedAt } }`。 必須 field の存在 +
- * 型 を fail-closed で gate、 違反は throw。 accountId / createdByUserId は projection で
- * drop (= internal scope)、 template は sanitizeText (= 制御文字 strip + 50000 char cap)
- * 経由で carry (= prompt injection 経路 構造防御)、 description も sanitize 経由。
- * variables / labels は backend で 既 JSON parse 済 (= shape は user 任意)、 そのまま carry。
+ * Shape gate + projection for the prompts/{id} resource template. The backend
+ * response shape is `{ prompt: { id, accountId, name, version, template,
+ * variables, labels, description, createdByUserId, createdAt, updatedAt } }`.
+ * Required fields' presence and type are gated fail-closed; violations throw.
+ * accountId / createdByUserId are dropped by the projection (internal scope);
+ * template goes through sanitizeText (control-character strip + 50000 char
+ * cap; structural defense of the prompt injection path), and description is
+ * sanitized too. variables / labels are already JSON-parsed by the backend
+ * (their shape is user-defined) and are carried as-is.
  */
 const MAX_PROMPT_TEMPLATE_LENGTH = 50_000;
 const MAX_PROMPT_NAME_LENGTH = 64;
@@ -1213,7 +1263,8 @@ function projectPromptForMcp(raw: unknown): unknown {
   if (templateSan !== undefined) projected["template"] = templateSan;
   const descSan = sanitizeText(p["description"], MAX_PROMPT_DESCRIPTION_LENGTH);
   if (descSan !== undefined) projected["description"] = descSan;
-  // labels / variables は backend で JSON parse 済 (= shape は user 任意)、 そのまま carry
+  // labels / variables are already JSON-parsed by the backend (shape is
+  // user-defined) and carried as-is.
   if (Array.isArray(p["labels"]) || p["labels"] === null) {
     projected["labels"] = p["labels"];
   }
@@ -1223,7 +1274,7 @@ function projectPromptForMcp(raw: unknown): unknown {
   if (typeof p["updatedAt"] === "string") {
     projected["updatedAt"] = p["updatedAt"];
   }
-  // accountId / createdByUserId は drop (= internal scope)
+  // accountId / createdByUserId are dropped (internal scope).
   return { prompt: projected };
 }
 
@@ -1260,7 +1311,7 @@ function projectSafetyAssessmentForMcp(raw: unknown): unknown {
   }
   const reasoning = sanitizeText(a["reasoning"], 4000);
   if (reasoning !== undefined) projected["reasoning"] = reasoning;
-  // accountId / createdByUserId / assessorCallId は drop (= internal scope)
+  // accountId / createdByUserId / assessorCallId are dropped (internal scope).
   return { assessment: projected };
 }
 
@@ -1293,10 +1344,11 @@ function projectEvalRunForMcp(raw: unknown): unknown {
     startedAt: r["startedAt"],
     completedAt: r["completedAt"],
   };
-  // summary は plain object 軸 (= scoredCount / failedCount / meanScoreByCriterion)、 そのまま carry
+  // summary is a plain object (scoredCount / failedCount /
+  // meanScoreByCriterion), carried as-is.
   if (r["summary"] !== undefined) runProjected["summary"] = r["summary"];
   if (r["datasetFilter"] !== undefined) runProjected["datasetFilter"] = r["datasetFilter"];
-  // accountId / createdByUserId は drop
+  // accountId / createdByUserId are dropped.
   const scoresProjected = Array.isArray(scoresRaw)
     ? scoresRaw.slice(0, 200).map((s) => {
         if (!s || typeof s !== "object") return null;
@@ -1316,9 +1368,10 @@ function projectEvalRunForMcp(raw: unknown): unknown {
 }
 
 function filterEnabledAlerts(raw: unknown): unknown {
-  // Codex v0.4.0 LOW 4 fix: 期待 shape (= { alerts: [...] }) でない response は
-  // silent に raw を carry せず fail-closed で throw (= 将来 backend response shape
-  // が変わった時に 意図しない field が LLM に 漏れる risk を 防ぐ)。
+  // Responses not matching the expected shape ({ alerts: [...] }) are not
+  // silently passed through raw; they throw fail-closed. This prevents the
+  // risk of unintended fields leaking to the LLM if the backend response shape
+  // changes in the future.
   if (
     typeof raw !== "object" ||
     raw === null ||
@@ -1330,10 +1383,12 @@ function filterEnabledAlerts(raw: unknown): unknown {
     );
   }
   const alerts = (raw as { alerts: Array<Record<string, unknown>> }).alerts;
-  // audit round2 SHIP_BLOCKER fix = 旧実装は `{ ...raw, alerts: filtered }` で各 alert を
-  // raw passthrough しており、 channelTargets (= webhook URL/secret/PagerDuty key/email) と
-  // accountId が そのまま LLM context に漏れていた。 detail path と同じ projectAlertObject
-  // allowlist を通して secret/PII を構造的に drop する。 ...raw spread も廃止。
+  // A previous implementation passed each alert through raw via
+  // `{ ...raw, alerts: filtered }`, leaking channelTargets (webhook URL /
+  // secret / PagerDuty key / email) and accountId straight into LLM context.
+  // Alerts now go through the same projectAlertObject allowlist as the detail
+  // path, structurally dropping secrets / PII. The ...raw spread was removed
+  // as well.
   return {
     alerts: alerts
       .filter((a) => a["enabled"] !== false)

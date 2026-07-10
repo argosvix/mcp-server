@@ -1,8 +1,8 @@
 # @argosvix/mcp-server
 
-**v0.30.0-alpha.10** — Argosvix MCP server lets AI agents (Claude Desktop, Cursor, Codex CLI, custom MCP clients) query, manage, and operate their LLM observability data directly from the conversation. Supports both **stdio** (subprocess) and **HTTP** (remote / self-host) transports.
+Argosvix MCP server lets AI agents (Claude Desktop, Cursor, Codex CLI, custom MCP clients) query, manage, and operate their LLM observability data directly from the conversation. Supports both **stdio** (subprocess) and **HTTP** (remote / self-host) transports.
 
-**Surface:** 87 tools (84 generally available + 3 founder-ops scoped) / 3 resources / 8 resource templates / 3 prompts. Autonomous-AI-ops endpoints (`get_account_health` / `detect_anomaly` / `propose_alert_rules` / `classify_calls_batch` / `propose_eval_criteria`) plus runtime control plane (budget gates / policy gates / human-approval gates) complete the "agent that can both observe AND act" narrative. Release history is available on [npm](https://www.npmjs.com/package/@argosvix/mcp-server?activeTab=versions).
+**Surface:** 87 tools (84 generally available + 3 internal operations tools that return 403 for customer accounts) / 3 resources / 8 resource templates / 3 prompts. Health and anomaly endpoints (`get_account_health` / `detect_anomaly` / `propose_alert_rules` / `classify_calls_batch` / `propose_eval_criteria`) plus a runtime control plane (budget gates / policy gates / human-approval gates) let an agent both observe and act. Release history is available on [npm](https://www.npmjs.com/package/@argosvix/mcp-server?activeTab=versions).
 
 [![npm version](https://img.shields.io/npm/v/@argosvix/mcp-server)](https://npmjs.com/package/@argosvix/mcp-server)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -256,7 +256,3 @@ ARGOSVIX_MCP_DEBUG=1 argosvix-mcp --http    # HTTP mode
 ```
 
 Without the env var, error logs only include `path`, `status`, and `x-request-id`.
-
-## Source mirror
-
-Development happens in a private monorepo; this repository mirrors the source of the published npm package [`@argosvix/mcp-server`](https://www.npmjs.com/package/@argosvix/mcp-server) (MIT). Issues and questions are welcome here.

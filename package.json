@@ -2,7 +2,7 @@
   "name": "@argosvix/mcp-server",
   "version": "0.30.0-alpha.14",
   "mcpName": "com.argosvix/server",
-  "description": "Argosvix MCP server — AI agent から traces / cost / alert / annotations / eval-criteria / prompts / safety / eval-runs / eval-gate / llm-budget / budget-gate / policy-gate / approvals / members / saved-views / audit-log / projects / account-health / alert-proposals / anomaly-detection / classify-batch / eval-criteria-propose / purge-expired-plaintext / retry-failed-webhook / auto-silence-noisy-alert / outbound-webhooks を直接 query / 監査 / 受領 / 調整するための Model Context Protocol server (stdio + HTTP transport、 tools 87 件 / resources 3 件 + template 8 件 / prompts 3 件、 stdio で resources subscribe + polling 60s 更新通知).",
+  "description": "Observability MCP server for AI agents: 87 tools to query and operate LLM cost, errors, latency, alerts, budgets, evals, prompts, approvals, and safety checks from Claude Desktop, Cursor, or any MCP client. stdio + HTTP transports, 3 resources + 8 templates + 3 prompts, resource subscriptions over stdio.",
   "author": "Yuto Makihara <hello@argosvix.com>",
   "license": "MIT",
   "type": "module",
@@ -42,11 +42,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/argosvix/Argosvix.git",
-    "directory": "packages/mcp-server"
+    "url": "git+https://github.com/argosvix/mcp-server.git"
   },
   "homepage": "https://argosvix.com",
   "bugs": {
-    "url": "https://github.com/argosvix/Argosvix/issues"
+    "url": "https://github.com/argosvix/mcp-server/issues"
   }
 }

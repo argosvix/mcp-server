@@ -18,13 +18,14 @@ import {
 } from "./toolDescriptionsEn.js";
 
 /**
- * 2026-07-03 = MCP 説明の言語切替 (ARGOSVIX_MCP_LANG)。
- * drift 防御 = 「正本 (tools.ts / resources.ts / prompts.ts) の description 持ち
- * フィールド全部 ⇔ 英語オーバーレイのエントリ全部」の集合一致を CI で固定する。
- * 片方向でなく双方向 assert (= 追加漏れとタイプミスの両方を検出)。
+ * Language switching for MCP descriptions (ARGOSVIX_MCP_LANG).
+ * Drift defense: CI pins set equality between "all description-bearing fields
+ * in the canonical sources (tools.ts / resources.ts / prompts.ts)" and "all
+ * entries in the English overlay". Asserted in both directions, not one
+ * (detects both missing additions and typos).
  */
 
-/** 実スキーマから description 持ちフィールドの dot path を再帰収集する。 */
+/** Recursively collects the dot paths of description-bearing fields from the real schema. */
 function collectDescribedPaths(
   node: SchemaNode,
   prefix: string,
@@ -37,7 +38,8 @@ function collectDescribedPaths(
       collectDescribedPaths(child, path, out);
     }
   }
-  // 配列は items を同じ prefix で透過的に降りる (= resolveSchemaNode と同じ規約)
+  // Arrays are traversed transparently through items with the same prefix
+  // (same convention as resolveSchemaNode).
   if (node.items) {
     collectDescribedPaths(node.items, prefix, out);
   }
@@ -152,7 +154,7 @@ describe("localize* の適用挙動", () => {
     expect(localized[0]!.description).toBe(
       TOOL_DESCRIPTIONS_EN[tools[0]!.name]!.description,
     );
-    // 元 (正本) は日本語のまま = deep copy されている
+    // The original (canonical) stays Japanese — proving the deep copy.
     expect(tools[0]!.description).toBe(originalDescription);
     expect(localized[0]).not.toBe(tools[0]);
   });
@@ -172,7 +174,7 @@ describe("localize* の適用挙動", () => {
     expect(metric?.description).toBe(
       TOOL_DESCRIPTIONS_EN["create_alert"]!.inputs!["conditions.conditions.metric"],
     );
-    // 元スキーマは日本語のまま
+    // The original schema stays Japanese.
     const originalMetric = resolveSchemaNode(
       tools.find((t) => t.name === "create_alert")!.inputSchema as SchemaNode,
       "conditions.conditions.metric",
@@ -202,7 +204,7 @@ describe("localize* の適用挙動", () => {
     expect(p.arguments?.[0]?.description).toBe(
       PROMPT_OVERLAYS_EN["cost_review"]!.arguments!["month"],
     );
-    // 元 prompt の引数 description は日本語のまま
+    // The original prompt's argument description stays Japanese.
     expect(prompts.find((x) => x.name === "cost_review")!.arguments?.[0]?.description).not.toBe(
       p.arguments?.[0]?.description,
     );

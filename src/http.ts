@@ -1,36 +1,39 @@
 /**
- * HTTP transport entry for Argosvix MCP server (Phase 3 = remote MCP server)。
+ * HTTP transport entry for the Argosvix MCP server (remote MCP server).
  *
- * @modelcontextprotocol/sdk の `StreamableHTTPServerTransport` (= Streamable HTTP、
- * MCP の modern spec) を 使い、 stateless mode で 1 request = 1 MCP session として
- * carry。 stdio mode と異なり、 認証情報 (= ARGOSVIX_API_KEY) は env var ではなく
- * 各 request の `Authorization: Bearer <key>` header から取り出す。
+ * Uses `StreamableHTTPServerTransport` from @modelcontextprotocol/sdk
+ * (Streamable HTTP, the modern MCP spec) in stateless mode, treating each
+ * request as its own MCP session. Unlike stdio mode, credentials come from
+ * each request's `Authorization: Bearer <key>` header instead of the
+ * ARGOSVIX_API_KEY env var.
  *
- * 起動:
+ * Startup:
  *   argosvix-mcp --http
- *   # オプション:
+ *   # Options:
  *   MCP_HTTP_PORT=4000 MCP_HTTP_HOST=0.0.0.0 \
  *   MCP_HTTP_ALLOWED_HOSTS=mcp.example.com \
  *   MCP_HTTP_ALLOWED_ORIGINS=https://app.example.com \
  *     argosvix-mcp --http
  *
- * client 例 (= MCP message を JSON-RPC で 直接送る):
+ * Client example (sending MCP messages directly as JSON-RPC):
  *   curl -X POST http://localhost:3000/mcp \
  *     -H "Authorization: Bearer argk_..." \
  *     -H "Content-Type: application/json" \
  *     -H "Accept: application/json, text/event-stream" \
  *     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
  *
- * セキュリティ設計 (= Codex review fix carry):
- *   - localhost bind (= 127.0.0.1 / localhost / ::1) では Host header を localhost
- *     allow list で 厳密検証 (= DNS rebinding 防御)。
- *   - non-local bind (= 0.0.0.0 等) では MCP_HTTP_ALLOWED_HOSTS の明示設定を必須化
- *     (= fail-closed)、 未設定なら起動 warning + 全 request を 403 reject。
- *   - CORS は MCP_HTTP_ALLOWED_ORIGINS で allow list 化 (= '*' は使わない)、
- *     未設定時は localhost-bind なら localhost-origin のみ allow、 それ以外は CORS
- *     header を返さず browser 経由 access を block。
- *   - shutdown は connection tracking + grace period timeout で keep-alive / SSE が
- *     残っても確実に終了する設計、 SIGTERM/SIGINT 多重発火は flag で 1 回限定。
+ * Security design:
+ *   - On localhost binds (127.0.0.1 / localhost / ::1) the Host header is
+ *     strictly validated against a localhost allow list (DNS rebinding defense).
+ *   - On non-local binds (0.0.0.0 etc.) MCP_HTTP_ALLOWED_HOSTS must be set
+ *     explicitly (fail-closed); if unset, a startup warning is printed and all
+ *     requests are rejected with 403.
+ *   - CORS uses an allow list via MCP_HTTP_ALLOWED_ORIGINS ('*' is never used).
+ *     When unset, localhost binds allow only localhost origins; otherwise no
+ *     CORS headers are returned, blocking browser-based access.
+ *   - Shutdown uses connection tracking plus a grace-period timeout so the
+ *     server terminates reliably even with lingering keep-alive / SSE
+ *     connections; repeated SIGTERM/SIGINT is limited to one run via a flag.
  */
 
 import {
@@ -78,16 +81,19 @@ const API_BASE =
 const PORT = Number.parseInt(process.env["MCP_HTTP_PORT"] ?? "3000", 10);
 const HOST = process.env["MCP_HTTP_HOST"] ?? "127.0.0.1";
 
-// 過大 body による メモリ枯渇防止。 通常の MCP message は 数 KB 未満。
+// Prevents memory exhaustion from oversized bodies. Normal MCP messages are
+// well under a few KB.
 const MAX_BODY_BYTES = 1_048_576; // 1 MiB
-// graceful shutdown 用 grace period (= keep-alive / SSE の自然 close を待つ時間)
+// Grace period for graceful shutdown (time to wait for keep-alive / SSE
+// connections to close naturally).
 const SHUTDOWN_GRACE_MS = 10_000;
 
-// localhost bind 判定 (= DNS rebinding / CORS の default 緩和を 限定する閾値)
+// Localhost-bind check (the boundary that limits the relaxed defaults for DNS
+// rebinding / CORS to local binds only).
 const isLocalBind =
   HOST === "127.0.0.1" || HOST === "localhost" || HOST === "::1";
 
-// Host header allow list (= 比較時に大文字小文字 ignore するため格納時 toLowerCase)
+// Host header allow list (stored lowercased so comparisons are case-insensitive).
 const DEFAULT_LOCAL_HOSTS = new Set([
   "localhost",
   "127.0.0.1",
@@ -106,7 +112,7 @@ const allowedHosts = allowedHostsEnv
     )
   : DEFAULT_LOCAL_HOSTS;
 
-// CORS Origin allow list (= '*' は使わない、 明示 allowlist 方式)
+// CORS Origin allow list ('*' is never used; explicit allowlist only).
 const allowedOriginsEnv = process.env["MCP_HTTP_ALLOWED_ORIGINS"];
 const allowedOrigins = allowedOriginsEnv
   ? new Set(
@@ -117,8 +123,8 @@ const allowedOrigins = allowedOriginsEnv
     )
   : null;
 
-// localhost-bind かつ MCP_HTTP_ALLOWED_ORIGINS 未設定 のとき、 localhost origin
-// だけを許可する default CORS 判定。
+// Default CORS check for localhost binds when MCP_HTTP_ALLOWED_ORIGINS is
+// unset: only localhost origins are allowed.
 const LOCALHOST_ORIGIN_PATTERN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
 
 function extractBearer(req: IncomingMessage): string | null {
@@ -129,26 +135,31 @@ function extractBearer(req: IncomingMessage): string | null {
 }
 
 /**
- * Host header check (Codex MEDIUM 3 fix = fail-closed)。
- *   - localhost bind: 既定 allow list (= DNS rebinding 防御)、 user 設定で上書き可
- *   - non-local bind: MCP_HTTP_ALLOWED_HOSTS の明示設定必須 (= 未設定なら全 reject)
+ * Host header check (fail-closed).
+ *   - localhost bind: default allow list (DNS rebinding defense), overridable
+ *     via user configuration
+ *   - non-local bind: MCP_HTTP_ALLOWED_HOSTS must be set explicitly (all
+ *     requests are rejected when unset)
  */
 function checkHost(req: IncomingMessage): boolean {
   const host = req.headers["host"];
   if (typeof host !== "string") return false;
   if (!isLocalBind && !allowedHostsEnv) {
-    // non-local bind + allowed hosts 未設定 = 起動時 warning 済、 全 reject で fail-closed
+    // Non-local bind with allowed hosts unset: a warning was printed at
+    // startup; reject everything (fail-closed).
     return false;
   }
   return allowedHosts.has(host.toLowerCase());
 }
 
 /**
- * CORS header 計算 (Codex MEDIUM 2 fix = '*' 廃止)。
- *   - Vary: Origin は常に付与 (= proxy / cache の origin-aware 化)
- *   - Access-Control-Allow-Origin は allowlist hit 時のみ反映、 認証 cookie ないので
- *     Allow-Credentials は不要 (= Bearer header で per-request 認証)
- *   - origin 不一致 / 未指定の non-browser request はそのまま通過 (= CORS の制約外)
+ * CORS header computation (no '*' wildcard).
+ *   - Vary: Origin is always set (makes proxies / caches origin-aware)
+ *   - Access-Control-Allow-Origin is set only on an allowlist hit; there are
+ *     no auth cookies, so Allow-Credentials is unnecessary (auth is
+ *     per-request via the Bearer header)
+ *   - Non-browser requests with a mismatched or missing origin pass through
+ *     unchanged (outside the scope of CORS)
  */
 function corsHeadersFor(req: IncomingMessage): Record<string, string> {
   const headers: Record<string, string> = {
@@ -166,7 +177,8 @@ function corsHeadersFor(req: IncomingMessage): Record<string, string> {
   if (allowedOrigins !== null) {
     allowed = allowedOrigins.has(origin);
   } else if (isLocalBind) {
-    // localhost bind + 設定なし = localhost 系 origin のみ default 許可
+    // Localhost bind with no configuration: only localhost origins are
+    // allowed by default.
     allowed = LOCALHOST_ORIGIN_PATTERN.test(origin);
   }
   if (allowed) headers["Access-Control-Allow-Origin"] = origin;
@@ -178,8 +190,8 @@ function applyCorsHeaders(req: IncomingMessage, res: ServerResponse): void {
   for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
 }
 
-// Codex round 2 MEDIUM 3 fix: CORS preflight 厳格化用の allow set + 判定 helper。
-// corsHeadersFor() と同じ allow ポリシーを 1 箇所で source of truth 化する。
+// Allow sets and helper for strict CORS preflight validation. Keeps the same
+// allow policy as corsHeadersFor() in a single source of truth.
 const ALLOWED_METHODS_SET = new Set([
   "POST",
   "GET",
@@ -205,8 +217,8 @@ function isPreflightAllowed(req: IncomingMessage): boolean {
   const origin = req.headers["origin"];
   if (typeof origin !== "string" || !isOriginAllowed(origin)) return false;
 
-  // Codex round 3 LOW fix: preflight は仕様上 Access-Control-Request-Method 必須なので、
-  // 未指定 / 空文字も 厳格 reject に carry する (= undershoot を 残さない)。
+  // The spec requires Access-Control-Request-Method on preflight requests, so
+  // a missing or empty value is also strictly rejected (no undershoot left).
   const reqMethod = req.headers["access-control-request-method"];
   if (typeof reqMethod !== "string" || reqMethod.trim().length === 0) {
     return false;
@@ -258,9 +270,11 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-// ARGOSVIX_MCP_PROFILE=core = 日常運用の要点 11 ツールだけを公開(stdio と同じ規約)。
+// ARGOSVIX_MCP_PROFILE=core exposes only the 11 essential day-to-day tools
+// (same convention as stdio).
 const HTTP_PROFILE = resolveToolProfile(process.env["ARGOSVIX_MCP_PROFILE"]);
-// ARGOSVIX_MCP_LANG = 説明の言語 (stdio と同じ規約、 未設定・不明値は en)。
+// ARGOSVIX_MCP_LANG = description language (same convention as stdio; unset or
+// unknown values fall back to en).
 const HTTP_LANG = resolveMcpLang(process.env["ARGOSVIX_MCP_LANG"]);
 const httpActiveTools = localizeTools(toolsForProfile(HTTP_PROFILE), HTTP_LANG);
 const httpActiveToolNames = new Set(httpActiveTools.map((t) => t.name));
@@ -353,16 +367,16 @@ async function handleMcpRequest(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
-  // 1) Host check (Codex MEDIUM 3 fix = fail-closed for non-local bind)
+  // 1) Host check (fail-closed for non-local binds)
   if (!checkHost(req)) {
     sendJson(res, 403, { error: "host header not allowed" });
     return;
   }
 
-  // 2) Bearer 認証
+  // 2) Bearer authentication
   const apiKey = extractBearer(req);
   if (!apiKey) {
-    // RFC 6750 = WWW-Authenticate header で how-to を伝える
+    // RFC 6750: communicate the how-to via the WWW-Authenticate header
     if (!res.headersSent) {
       res.setHeader(
         "WWW-Authenticate",
@@ -375,7 +389,8 @@ async function handleMcpRequest(
     return;
   }
 
-  // 3) POST の場合 body を parse して transport に渡す (SDK の推奨 pattern)
+  // 3) For POST, parse the body and hand it to the transport (the SDK's
+  //    recommended pattern)
   let parsedBody: unknown = undefined;
   if (req.method === "POST") {
     try {
@@ -414,7 +429,7 @@ async function handleMcpRequest(
 
 export async function runHttp(): Promise<void> {
   if (!isLocalBind && !allowedHostsEnv) {
-    // Codex MEDIUM 3 fix: 起動時に明示警告 (= 全 request が 403 になる旨)
+    // Explicit warning at startup (all requests will get 403)
     // eslint-disable-next-line no-console
     console.error(
       `[argosvix-mcp] WARNING: HOST=${HOST} is non-local but MCP_HTTP_ALLOWED_HOSTS is not set. ` +
@@ -422,9 +437,10 @@ export async function runHttp(): Promise<void> {
     );
   }
 
-  // Codex round 2 HIGH 1 fix: shutdown 開始後は keep-alive 経由の新規 request を 503
-  // で返し、 drain 中に処理継続する race を 構造的に塞ぐ。 flag は handler / shutdown
-  // 両方から参照するので runHttp の topmost に置く。
+  // Once shutdown begins, new requests arriving over keep-alive connections
+  // get 503, structurally closing the race where work continues during drain.
+  // The flag lives at the top of runHttp because both the handler and
+  // shutdown reference it.
   let isShuttingDown = false;
 
   const httpServer = createServer((req, res) => {
@@ -437,8 +453,9 @@ export async function runHttp(): Promise<void> {
     applyCorsHeaders(req, res);
 
     if (req.method === "OPTIONS") {
-      // Codex round 2 MEDIUM 3 fix: CORS preflight 厳格化。 Origin 不許可 / 要求
-      // method が allowlist 外 / 要求 header が allowlist 外 なら 403 で 明示拒否。
+      // Strict CORS preflight: explicitly reject with 403 when the Origin is
+      // not allowed, or the requested method or headers fall outside the
+      // allowlist.
       if (!isPreflightAllowed(req)) {
         sendJson(res, 403, { error: "cors preflight rejected" });
         return;
@@ -471,14 +488,14 @@ export async function runHttp(): Promise<void> {
     sendJson(res, 404, { error: "not found" });
   });
 
-  // Codex HIGH 1 fix: socket tracking で shutdown 時の force close path を持つ
+  // Track sockets so shutdown has a force-close path.
   const openSockets = new Set<Socket>();
   httpServer.on("connection", (socket) => {
     openSockets.add(socket);
     socket.once("close", () => openSockets.delete(socket));
   });
 
-  // Codex MEDIUM 4 fix: listen() の error を Promise reject に carry
+  // Propagate listen() errors into a Promise rejection.
   await new Promise<void>((resolve, reject) => {
     const onError = (err: NodeJS.ErrnoException): void => {
       // eslint-disable-next-line no-console
@@ -490,9 +507,10 @@ export async function runHttp(): Promise<void> {
     httpServer.once("error", onError);
     httpServer.listen(PORT, HOST, () => {
       httpServer.off("error", onError);
-      // Codex round 2 MEDIUM 2 fix: listen success 後に発生する error イベントを
-      // 常設 handler で受け、 process crash 経路 (= 未処理 error → uncaught exception
-      // → 即落ち) を防ぐ。 重大エラーなら shutdown を試みる。
+      // Keep a permanent handler for error events that occur after a
+      // successful listen, preventing the process-crash path (unhandled error
+      // -> uncaught exception -> immediate exit). Attempt shutdown on serious
+      // errors.
       httpServer.on("error", (err: NodeJS.ErrnoException) => {
         // eslint-disable-next-line no-console
         console.error("[argosvix-mcp] http server error event:", err);
@@ -506,7 +524,7 @@ export async function runHttp(): Promise<void> {
     });
   });
 
-  // Codex HIGH 1 fix: shutdown は flag で 1 度限定、 grace period 後 force close
+  // Shutdown runs at most once via the flag; force-close after the grace period.
   const shutdown = (signal: string): void => {
     if (isShuttingDown) return;
     isShuttingDown = true;
@@ -518,8 +536,8 @@ export async function runHttp(): Promise<void> {
       exited = true;
       process.exit(code);
     };
-    // Codex round 2 HIGH 1 fix 補足: idle keep-alive socket を即座に閉じて drain を
-    // 早める (Node 20+)。 active socket は grace period で待つ。
+    // Close idle keep-alive sockets immediately to speed up the drain
+    // (Node 20+). Active sockets get the grace period.
     httpServer.closeIdleConnections?.();
     httpServer.close((err) => {
       if (err) {

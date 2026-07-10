@@ -1,23 +1,21 @@
 /**
- * MCP tool definitions + dispatcher。
+ * MCP tool definitions and dispatcher.
  *
- * 各 tool は JSON Schema で input を 定義し、 dispatch で Argosvix backend HTTP
- * endpoint へ転送する。
+ * Each tool defines its input with a JSON Schema, and dispatch forwards it to
+ * an Argosvix backend HTTP endpoint.
  *
- * read tools:
- * - query_calls = 直近の LLM 呼び出し record を filter + paginate で取得
- * - get_cost_summary = 期間別 (= 24h / 7d / 30d) の cost / call / token 集計
- * - list_alerts = 設定済 alert の一覧 + 直近 status
- * - get_alert = 指定 alert の詳細 + 直近 trigger 履歴 (= Phase 3)
- * - list_alert_events = alert 発火履歴を新しい順で取得 (= Phase 3)
+ * Core read tools:
+ * - query_calls = fetch recent LLM call records with filtering + pagination
+ * - get_cost_summary = cost / call / token aggregation by period (24h / 7d / 30d)
+ * - list_alerts = list of configured alerts + latest status
+ * - get_alert = a given alert's detail + recent trigger history
+ * - list_alert_events = alert trigger history, newest first
  *
- * write tools:
- * - silence_alert / unsilence_alert = alert のミュート操作 (= Phase 2)
- * - create_alert = 新規 alert ルール作成 (= Phase 3)
- * - update_alert / delete_alert = alert lifecycle 完結 (= v1.6 #13-4)
- * - create_annotation / update_annotation / delete_annotation = annotation CRUD (= v1.6 #13-3)
- *
- * 残 (= acknowledge_alert / HTTP transport / resources・prompts) は後続 phase。
+ * Core write tools:
+ * - silence_alert / unsilence_alert = alert mute operations
+ * - create_alert = create a new alert rule
+ * - update_alert / delete_alert = complete the alert lifecycle
+ * - create_annotation / update_annotation / delete_annotation = annotation CRUD
  */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
@@ -26,27 +24,29 @@ import { MCP_VERSION } from "./version.js";
 import { isDebugEnabled } from "./debug.js";
 
 /**
- * 各 tool で URL 転送を許可する arg key 一覧。 LLM が schema 外の追加 arg
- * (= e.g. `account_id` / `endpoint` 等) を 渡しても URL に乗らないように
- * structural allowlist で防御 (= Codex r4 derive HIGH 4)。
- * inputSchema にも additionalProperties: false を設定し MCP SDK 側で validate
- * させる二重防御。
+ * List of arg keys each tool may forward to the URL. A structural allowlist
+ * ensures that extra args outside the schema (e.g. `account_id` / `endpoint`)
+ * never reach the URL even if the LLM passes them. inputSchema also sets
+ * additionalProperties: false so the MCP SDK validates too — double defense.
  */
 const TOOL_ARG_ALLOWLIST: Record<string, ReadonlyArray<string>> = {
-  // R74 HIGH 1 fix: latencyMin/Max を allowlist に追加 (= schema + dispatcher に
-  // 追加しただけでは safeArgs で落ちて backend に渡らず、 silent 未フィルタだった)
-  query_calls: ["limit", "provider", "model", "rangePreset", "latencyMin", "latencyMax", "beforeTimestamp", "beforeId"],
+  // latencyMin/Max must be in the allowlist: adding them only to the schema
+  // and dispatcher meant safeArgs dropped them and they never reached the
+  // backend — a silent no-filter bug.
+  query_calls: ["limit", "provider", "model", "rangePreset", "latencyMin", "latencyMax", "beforeTimestamp", "beforeId", "tagKey", "tagValue"],
   get_cost_summary: ["rangePreset", "groupBy"],
   list_alerts: ["includeTriggered"],
-  // 番人の受信箱(read + 会話のみ。decide は自己承認防止で dashboard 限定)。
+  // Guardian inbox (read + conversation only; deciding is dashboard-only to
+  // prevent self-approval).
   list_proposals: [],
   get_proposal_thread: ["proposalId"],
   reply_proposal: ["proposalId", "body"],
-  // Phase 2 write tools = alertId は path 直前置換、 body field のみ allowlist
+  // Alert mute write tools: alertId is substituted into the path just before
+  // the request; only body fields are allowlisted.
   silence_alert: ["alertId", "until"],
   unsilence_alert: ["alertId"],
-  // Phase 3 write tool = create_alert。 backend POST /v1/alerts の body field のみ
-  // allowlist (= account_id 等の injection を構造防御)。
+  // create_alert: only the body fields of backend POST /v1/alerts are
+  // allowlisted (structural defense against injecting account_id etc.).
   create_alert: [
     "name",
     "alertType",
@@ -61,10 +61,10 @@ const TOOL_ARG_ALLOWLIST: Record<string, ReadonlyArray<string>> = {
     "conditions",
     "evalCriterionId",
   ],
-  // 2026-06-03 v1.6 #13-4 = update_alert / delete_alert tools (= axis 1 強化)。
-  // backend PATCH/DELETE /v1/alerts/:id の wrap。 alertType は immutable (= backend
-  // validateUpdate で 400)、 schema 側にも入れない。 alertId は path 直前置換、
-  // body field のみ allowlist。
+  // update_alert / delete_alert: wrap backend PATCH/DELETE /v1/alerts/:id.
+  // alertType is immutable (the backend's validateUpdate returns 400), so it
+  // is left out of the schema too. alertId is substituted into the path just
+  // before the request; only body fields are allowlisted.
   update_alert: [
     "alertId",
     "name",
@@ -79,67 +79,77 @@ const TOOL_ARG_ALLOWLIST: Record<string, ReadonlyArray<string>> = {
     "conditions",
   ],
   delete_alert: ["alertId"],
-  // Phase 3 read tools = alertId は path 直前置換 (= GET /v1/alerts/:id)。
-  // list_alert_events は query param (limit / alertId) のみ allowlist。
+  // Alert read tools: alertId is substituted into the path just before the
+  // request (GET /v1/alerts/:id). list_alert_events allowlists only the query
+  // params (limit / alertId).
   get_alert: ["alertId"],
-  // 2026-06-12 発火履歴深掘り = keyset cursor (beforeTriggeredAt + beforeId) パリティ。
+  // Trigger-history drill-down: keyset cursor (beforeTriggeredAt + beforeId)
+  // parity with the REST API.
   list_alert_events: ["limit", "alertId", "beforeTriggeredAt", "beforeId"],
-  // 2026-05-31 Phase 3 = acknowledge_alert tool。 eventId は path 直前置換、 body は空
-  // (= source は MCP server 側で 強制的に "mcp" carry、 LLM から override させない)。
+  // acknowledge_alert: eventId is substituted into the path just before the
+  // request; the body is empty (the source is forced to "mcp" on the MCP
+  // server side and cannot be overridden by the LLM).
   acknowledge_alert: ["eventId"],
-  // 2026-06-02 v1.5 = annotation read tools。 callId / annotationId / label / limit を
-  // backend /v1/annotations?callId=xxx / /v1/annotations/:id / /v1/annotations?label=xxx
-  // への path / query へ carry。 user-controlled string は dispatch 側で再 validate。
+  // Annotation read tools: callId / annotationId / label / limit map to the
+  // backend's /v1/annotations?callId=xxx / /v1/annotations/:id /
+  // /v1/annotations?label=xxx path / query. User-controlled strings are
+  // re-validated on the dispatch side.
   list_annotations_for_call: ["callId"],
   list_annotations_by_label: ["label", "limit"],
   get_annotation: ["annotationId"],
-  // 2026-06-03 v1.6 #13-3 = annotation CRUD write tools (= axis 1 強化、
-  // 全社未対応領域での 新規優位)。 backend POST/PATCH/DELETE /v1/annotations を
-  // allowlist 経由で wrap。 annotation_text / label / quality_score の値域は
-  // backend で 最終 validation (= 2000 char / 50 char + 英数 _ - / 1-5 integer)。
+  // Annotation CRUD write tools: wrap backend POST/PATCH/DELETE
+  // /v1/annotations through the allowlist. The value ranges of
+  // annotation_text / label / quality_score get final validation on the
+  // backend (2000 chars / 50 chars + alphanumerics _ - / integer 1-5).
   create_annotation: ["callId", "annotationText", "label", "qualityScore"],
   update_annotation: ["annotationId", "annotationText", "label", "qualityScore"],
   delete_annotation: ["annotationId"],
-  // 2026-06-02 v1.5 = eval criteria read tools。 global default + 自 account custom
-  // の両方を visible。 criterionId は AUTOINCREMENT integer、 dispatch 側で validate。
+  // Eval criteria read tools: both global defaults and the account's own
+  // custom criteria are visible. criterionId is an AUTOINCREMENT integer,
+  // validated on the dispatch side.
   list_eval_criteria: [],
   get_eval_criterion: ["criterionId"],
-  // 2026-06-03 v1.6 #13-2 = eval criteria write tools (= axis 1 強化、 Langfuse 未対応領域)。
-  // Pro+ 専用。 create + update = full replace (= name + rubric + scaleMin + scaleMax 全
-  // 必須)、 delete = 自 account 内 only (= global default は 構造防御で対象外)。
+  // Eval criteria write tools. Pro+ only. create + update are full replace
+  // (name + rubric + scaleMin + scaleMax all required); delete works only
+  // within the account (global defaults are structurally excluded).
   create_eval_criterion: ["name", "rubric", "scaleMin", "scaleMax", "type", "config", "scoreType", "scope"],
   update_eval_criterion: ["criterionId", "name", "rubric", "scaleMin", "scaleMax", "type", "config", "scoreType", "scope"],
   delete_eval_criterion: ["criterionId"],
-  // 2026-06-03 v1.6 #13-5 = test_webhook tool (= alert webhook 試送 path)。
-  // backend POST /v1/alerts/test-webhook を allowlist 経由で wrap。 URL は SSRF
-  // 防御 (= validateWebhookTarget)、 secret は HMAC 署名用、 rate limit 5/分。
+  // test_webhook (alert webhook test-send path): wraps backend POST
+  // /v1/alerts/test-webhook through the allowlist. The URL is SSRF-guarded
+  // (validateWebhookTarget), secret is for HMAC signing, rate limit 5/min.
   test_webhook: ["url", "secret", "alertName"],
-  // 2026-06-27 外向き event webhook CRUD (= /v1/webhooks)。 list は Free 閲覧可、
-  // create/update/delete は Pro+。 url は SSRF 防御 (= validateWebhookUrl)、 secret は
-  // HMAC 署名用、 eventTypes は購読 event 種別の配列、 webhookId は path 直前置換。
+  // Outbound event webhook CRUD (/v1/webhooks). list is viewable on Free;
+  // create/update/delete are Pro+. url is SSRF-guarded (validateWebhookUrl),
+  // secret is for HMAC signing, eventTypes is the array of subscribed event
+  // kinds, webhookId is substituted into the path just before the request.
   list_webhooks: [],
   create_webhook: ["url", "secret", "eventTypes", "description", "enabled"],
   update_webhook: ["webhookId", "url", "secret", "eventTypes", "description", "enabled"],
   delete_webhook: ["webhookId"],
-  // 2026-06-03 v1.6 #13-7 = LLM feature budget tools (= safety classifier +
-  // PII audit + eval baseline runner の 月予算 cap)。 get は Free / Pro+ 共通、
-  // raise は Pro+ 専用、 $5-$500 hard cap。 default $5 で 月跨ぎ で 自動 reset。
+  // LLM feature budget tools (the monthly budget cap for the safety
+  // classifier + PII audit + eval baseline runner). get is shared by Free /
+  // Pro+; raise is Pro+ only, with a $5-$500 hard cap. Defaults to $5 and
+  // resets automatically at month rollover.
   get_llm_budget: [],
   raise_llm_budget: ["budgetUsd"],
-  // 2026-06-10 ランタイム制御プレーン Phase 1 = runtime 予算ゲート tools。
-  // user 自身の LLM 支出に対する実行前 enforce の設定 (llm_feature_budget とは別物)。
-  // get は Free / Pro+ 共通、 create / update / delete は Pro+ (= backend plan gate)。
-  // gateId は path 直前置換、 値域 validation は backend 側で最終実施。
+  // Runtime budget gate tools (runtime control plane): pre-execution
+  // enforcement settings for the user's own LLM spend (distinct from
+  // llm_feature_budget). get is shared by Free / Pro+; create / update /
+  // delete are Pro+ (backend plan gate). gateId is substituted into the path
+  // just before the request; range validation is finalized on the backend.
   get_budget_gate: [],
   create_budget_gate: ["monthlyLimitUsd", "enforceMode", "enabled", "projectId", "tagKey", "tagValue"],
   update_budget_gate: ["gateId", "monthlyLimitUsd", "enforceMode", "enabled"],
   delete_budget_gate: ["gateId"],
-  // 2026-06-10 ランタイム制御プレーン Phase 2 = ポリシーゲート tools。
-  // モデル allowlist / PII block / secret block の実行前 enforce 設定。
-  // get は Free / Pro+ 共通、 create / update / delete は Pro+ (= backend plan gate)。
-  // 2026-06-10 Phase 3 = 人間承認ゲート tools。 依頼と状態確認のみで、
-  // 承認 / 否認の tool は存在しない (= agent の自己承認を構造防止。 決定は
-  // dashboard /approvals か email link で人間が行う)。
+  // Policy gate tools (runtime control plane): pre-execution enforcement
+  // settings for the model allowlist / PII block / secret block. get is
+  // shared by Free / Pro+; create / update / delete are Pro+ (backend plan
+  // gate).
+  // Human approval gate tools: requesting and status-checking only — there is
+  // no approve / deny tool (structurally preventing agent self-approval;
+  // decisions are made by a human on the dashboard /approvals page or via an
+  // email link).
   request_approval: ["action", "summary", "metadata", "timeoutSeconds"],
   get_approval: ["approvalId"],
   list_approvals: ["status"],
@@ -147,38 +157,42 @@ const TOOL_ARG_ALLOWLIST: Record<string, ReadonlyArray<string>> = {
   create_policy_gate: ["modelAllowlist", "blockPii", "blockSecrets", "enforceMode", "enabled"],
   update_policy_gate: ["policyId", "modelAllowlist", "blockPii", "blockSecrets", "enforceMode", "enabled"],
   delete_policy_gate: ["policyId"],
-  // 2026-06-02 v1.5 Round F = prompt registry read tools。 user の保存 prompt
-  // template を tap で取得、 AI agent が template + variables + labels を context
-  // に取り込む path。 name / label / limit は query param、 promptId は path 直前置換。
+  // Prompt registry read tools: fetch the user's saved prompt templates, the
+  // path by which an AI agent pulls template + variables + labels into
+  // context. name / label / limit are query params; promptId is substituted
+  // into the path just before the request.
   list_prompts: ["label", "name", "limit"],
   get_prompt: ["promptId"],
-  // 2026-06-03 v1.6 #13-1 = prompt registry write tools (= axis 1 強化、 Langfuse
-  // 比較で同等領域)。 Pro+ 専用。 create = 新 version 作成、 update = template /
-  // variables / labels / description の部分更新、 rename = name + version 変更
-  // (= typo 修正軸、 UNIQUE 衝突 → 409)、 delete = 削除 (= 204)。 backend が field
-  // validation + plan gate + Origin/Referer CSRF 防御を carry する path に乗る。
+  // Prompt registry write tools. Pro+ only. create = create a new version;
+  // update = partial update of template / variables / labels / description;
+  // rename = change name + version (for typo fixes; a UNIQUE collision yields
+  // 409); delete = deletion (204). Rides the path where the backend handles
+  // field validation + plan gating + Origin/Referer CSRF defense.
   create_prompt: ["name", "version", "template", "variables", "labels", "description"],
   update_prompt: ["promptId", "template", "variables", "labels", "description"],
   rename_prompt: ["promptId", "name", "version"],
   delete_prompt: ["promptId"],
-  // 2026-06-27 プロンプトのデプロイ/ロールバック(label = 環境)。 deploy/rollback は Pro+、
-  // get_deployed/list は Free。 promptId は path 直前置換、 name/label は query/body。
+  // Prompt deploy / rollback (label = environment). deploy/rollback are Pro+;
+  // get_deployed/list are Free. promptId is substituted into the path just
+  // before the request; name/label go in the query/body.
   deploy_prompt: ["promptId", "label"],
   rollback_prompt: ["name", "label"],
   get_deployed_prompt: ["name", "label"],
   list_prompt_deployments: ["name", "label"],
-  // 2026-06-02 v1.5 closure = safety classifier read tools。 OpenAI Moderation
-  // cron が書き込んだ assessment を AI agent から閲覧する path。 callId は
-  // /v1/safety-assessments?call_id= query param、 assessmentId は path 直前置換。
+  // Safety classifier read tools: the path by which an AI agent views
+  // assessments written by the OpenAI Moderation cron. callId maps to the
+  // /v1/safety-assessments?call_id= query param; assessmentId is substituted
+  // into the path just before the request.
   list_safety_assessments: ["callId", "limit"],
   get_safety_assessment: ["assessmentId"],
-  // 2026-06-02 v1.5 closure = eval baseline runner tools。 list は GET、 detail
-  // は scores 同梱、 run は POST (= Pro+ で startEvalRun に渡す軸)。
+  // Eval baseline runner tools: list is GET, detail bundles the scores, run
+  // is POST (Pro+, handed to startEvalRun).
   list_eval_runs: ["limit"],
   get_eval_run: ["runId"],
   compare_eval_runs: ["baselineRunId", "candidateRunId"],
-  // 2026-06-12 v1.6-backlog #21 = 危険 mutation に optional approvalId (= server-side
-  // で「approved + 期限内 + action 一致 + 未消費」を atomic 検証・消費、 1 approval = 1 実行)。
+  // Dangerous mutations take an optional approvalId: the server atomically
+  // verifies and consumes it ("approved + within expiry + action matches +
+  // unconsumed"; 1 approval = 1 execution).
   bulk_delete_calls: ["callIds", "dryRun", "approvalId"],
   export_calls: ["startTime", "endTime", "provider", "model", "limit"],
   list_saved_views: [],
@@ -188,49 +202,54 @@ const TOOL_ARG_ALLOWLIST: Record<string, ReadonlyArray<string>> = {
   aggregate_calls: ["startTime", "endTime", "groupBy", "metric", "provider", "tagKey"],
   get_percentiles: ["startTime", "endTime", "provider", "model", "metric", "groupBy"],
   list_projects: [],
-  // 2026-06-10 Team v1 = read-only Team tool。 list_members は GET /v1/memberships
-  // の wrap。 招待 / ロール変更 / 削除の mutation は権限操作 (= 人間承認ゲートで
-  // Bearer を 403 にした思想と整合) のため素の MCP tool にせず、 将来 chat 確認カード /
-  // 承認ゲート経由で設計する。
+  // Read-only Team tool: list_members wraps GET /v1/memberships. Invite /
+  // role-change / removal mutations are permission operations (consistent
+  // with the philosophy of the human approval gate returning 403 for Bearer),
+  // so they are not plain MCP tools; a future design will route them through
+  // chat confirmation cards / the approval gate.
   list_members: [],
   create_project: ["name", "slug"],
   rename_project: ["projectId", "name", "slug"],
   delete_project: ["projectId"],
-  // 2026-06-05 axis 4 Tier 1 = get_account_health (= AI agent が 1 call で
-  // 自社 LLM infra の健康状態 サマリを取得)。 既存 4 endpoint (= aggregate /
-  // percentiles / llm-budget / audit) を 並列 fetch + 1 narrative response に
-  // 圧縮。 window 軸のみ 受け、 backend 新 endpoint 不要 (= 純 read aggregator)。
+  // get_account_health: an AI agent gets a health summary of its LLM infra in
+  // one call. Fetches 4 existing endpoints (aggregate / percentiles /
+  // llm-budget / audit) in parallel and compresses them into one narrative
+  // response. Accepts only a window parameter; no new backend endpoint needed
+  // (a pure read aggregator).
   get_account_health: ["window"],
-  // 2026-06-05 axis 4 Tier 1 = propose_alert_rules (= AI が baseline 統計から
-  // 推奨 alert rule を 提案、 適用は customer 確認後 create_alert 別 step)。
-  // 既存 4 endpoint (= aggregate ×2 + percentiles + list_alerts) を fetch +
-  // 推奨 JSON を 返す。 backend 新 endpoint 不要。
+  // propose_alert_rules: the AI proposes recommended alert rules from
+  // baseline statistics; applying them is a separate create_alert step after
+  // customer confirmation. Fetches 4 existing endpoints (aggregate x2 +
+  // percentiles + list_alerts) and returns recommendation JSON. No new
+  // backend endpoint needed.
   propose_alert_rules: ["lookbackDays"],
-  // 2026-06-05 axis 4 Tier 1 = detect_anomaly (= 現 window vs baseline window
-  // 比較で cost / latency / error_rate / call_volume の 4 軸 異常検出)。
-  // pure MCP-side aggregator、 backend 変更ゼロ。
+  // detect_anomaly: anomaly detection on 4 dimensions (cost / latency /
+  // error_rate / call_volume) by comparing the current window against a
+  // baseline window. A pure MCP-side aggregator; zero backend changes.
   detect_anomaly: ["window", "threshold"],
-  // 2026-06-05 axis 4 Tier 1 = classify_calls_batch (= AI agent が on-demand
-  // で 未分類 call を 一括 safety scan、 POST /v1/safety-assessments/scan-batch
-  // wrap)。 Pro+ plan gate + budget gate は backend で carry。
+  // classify_calls_batch: an AI agent batch-safety-scans unclassified calls
+  // on demand (wraps POST /v1/safety-assessments/scan-batch). The Pro+ plan
+  // gate and budget gate are handled on the backend.
   classify_calls_batch: ["maxRecords"],
-  // 2026-06-05 axis 4 Tier 1 closing = propose_eval_criteria (= LLM-judge で
-  // useCaseHint + 任意 sampleCallIds から eval criterion 候補生成、
-  // POST /v1/eval-criteria/propose wrap)。 Pro+ + budget gate は backend で carry、
-  // INSERT しない (= 「propose」 軸、 user 採用判断は create_eval_criterion で別 step)。
+  // propose_eval_criteria: generates eval criterion candidates via LLM judge
+  // from useCaseHint + optional sampleCallIds (wraps POST
+  // /v1/eval-criteria/propose). The Pro+ and budget gates are handled on the
+  // backend; nothing is INSERTed (it only "proposes" — the user's adoption
+  // decision is a separate create_eval_criterion step).
   propose_eval_criteria: ["useCaseHint", "sampleCallIds", "maxCriteria"],
-  // 2026-06-02 Codex round 2 🔴 fix = idempotencyKey 必須 path (= AI agent が
-  // retry した時に backend で dedup)、 client が opaque string 64 char で carry。
+  // idempotencyKey is required on this path (so the backend can dedupe when
+  // an AI agent retries); the client supplies an opaque string up to 64 chars.
   run_eval: ["name", "recentCount", "label", "promptRegistryId", "idempotencyKey"],
-  // 2026-06-15 #2 Phase D4 = golden dataset (期待出力つき固定テストセット) ツール。
-  // list/get/create は CRUD、 run は対象モデルで実行 → judge → eval_scores (= 回帰 A/B)。
+  // Golden dataset tools (a fixed test set with expected outputs).
+  // list/get/create are CRUD; run executes against the target model → judge →
+  // eval_scores (regression A/B).
   list_eval_datasets: [],
   get_eval_dataset: ["datasetId"],
   create_eval_dataset: ["name", "description", "items", "frozen"],
   run_eval_dataset: ["datasetId", "targetModel", "judgeModel", "idempotencyKey"],
   delete_eval_dataset: ["datasetId"],
-  // 2026-06-06 axis 4 Tier 2 = 自律 AI ops 第一弾。 mutation 軸なので dryRun 必須、
-  // backend で audit emit + UPDATE 順序 + idempotency carry (= R35 narrative)。
+  // Autonomous AI ops tools. These are mutations, so dryRun is required; the
+  // backend handles audit emission + UPDATE ordering + idempotency.
   purge_expired_plaintext: ["olderThanDays", "dryRun", "approvalId"],
   retry_failed_webhook: ["eventIds", "fromTimestamp", "toTimestamp", "maxRetries", "dryRun", "approvalId"],
   auto_silence_noisy_alert: [
@@ -241,9 +260,9 @@ const TOOL_ARG_ALLOWLIST: Record<string, ReadonlyArray<string>> = {
     "dryRun",
     "approvalId",
   ],
-  // 2026-06-07 axis 4 Tier 2 第三弾 = founder dogfood scope の Stripe mutation。
-  // irreversible 軸 (= trial 延長 / promo 適用)、 backend で audit emit + Stripe
-  // Idempotency-Key carry、 dryRun=true で preview のみ。
+  // Operator-scoped Stripe mutations. These are irreversible (trial extension
+  // / promo application); the backend handles audit emission + the Stripe
+  // Idempotency-Key, and dryRun=true previews only.
   extend_customer_trial: ["targetAccountId", "extendDays", "reason", "dryRun", "idempotencyKey", "approvalId"],
   apply_promo_code_to_customer: ["targetAccountId", "promoCode", "reason", "dryRun", "idempotencyKey", "approvalId"],
 };
@@ -253,7 +272,7 @@ export const tools: Tool[] = [
     name: "query_calls",
     description:
       "Argosvix にて記録された直近の LLM 呼び出し record を取得する。 " +
-      "provider / model / 期間 / tag で filter 可能。 デフォルトは 直近 24 時間 + 100 件。",
+      "provider / model / 期間 / tag (= tagKey + tagValue の組) で filter 可能。 デフォルトは 直近 24 時間 + 100 件。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -298,6 +317,15 @@ export const tools: Tool[] = [
         beforeId: {
           type: "string",
           description: "keyset pagination cursor (= 前ページ最終行の id)。 beforeTimestamp と必ず併用",
+        },
+        tagKey: {
+          type: "string",
+          description:
+            "filter する tag の key (= 英数字 + _ - のみ、 1-64 文字、 先頭と末尾に - は不可)。 tagValue と必ず併用 (= 片方だけは 400)",
+        },
+        tagValue: {
+          type: "string",
+          description: "filter する tag の値 (= 完全一致、 1-256 文字)。 tagKey と必ず併用",
         },
       },
     },
@@ -451,8 +479,9 @@ export const tools: Tool[] = [
           description: "alert の表示名 (1-100 文字、 改行不可)",
           minLength: 1,
           maxLength: 100,
-          // backend は CR/LF を含む name を拒否する (= email header / Slack text 注入防御)。
-          // schema 側でも弾いて無駄な 400 を避ける。
+          // The backend rejects names containing CR/LF (email header / Slack
+          // text injection defense). Rejecting on the schema side too avoids a
+          // wasted 400.
           pattern: "^[^\\r\\n]{1,100}$",
         },
         alertType: {
@@ -558,10 +587,10 @@ export const tools: Tool[] = [
         conditions: {
           type: "object",
           description:
-            "v1.5 multi-condition alert (= 複合条件)。 指定すると alertType + thresholdValue + " +
+            "複合条件 alert (= multi-condition)。 指定すると alertType + thresholdValue + " +
             "windowMinutes の単 metric 評価が ignored になり、 conditions JSON で AND/OR 集約 path に " +
             "switch する。 例: {\"operator\":\"AND\",\"conditions\":[{\"metric\":\"cost_threshold\",\"threshold\":100,\"windowMinutes\":60,\"comparator\":\">\"},{\"metric\":\"error_rate\",\"threshold\":0.05,\"windowMinutes\":60,\"comparator\":\">\"}]}。" +
-            " backend で parseConditionsJson で shape 検証 (= operator AND/OR、 conditions 1-8 件、 各 metric/threshold/windowMinutes/comparator 必須)。 不要なら 省略 (= null) で 単 metric path に carry。",
+            " backend で parseConditionsJson で shape 検証 (= operator AND/OR、 conditions 1-8 件、 各 metric/threshold/windowMinutes/comparator 必須)。 不要なら 省略 (= null) で 単 metric 評価のまま。",
           required: ["operator", "conditions"],
           additionalProperties: false,
           properties: {
@@ -574,7 +603,7 @@ export const tools: Tool[] = [
               type: "array",
               minItems: 1,
               maxItems: 8,
-              description: "1-8 件の sub-condition。 8 件超は backend で 400 narrative。",
+              description: "1-8 件の sub-condition。 8 件超は backend が 400 を返す。",
               items: {
                 type: "object",
                 additionalProperties: false,
@@ -582,7 +611,7 @@ export const tools: Tool[] = [
                 properties: {
                   metric: {
                     type: "string",
-                    description: "対象 metric (= alertType と同じ enum 値想定: cost_threshold / error_rate / latency_p95 等)",
+                    description: "対象 metric。 alert type と同じ値 (cost_threshold / error_rate / latency_degradation / monthly_budget 等) を使う。 それ以外の値 (例 latency_p95) は評価されず、 その条件は永遠に成立しない。",
                   },
                   threshold: {
                     type: "number",
@@ -644,12 +673,12 @@ export const tools: Tool[] = [
         },
         filterProvider: {
           type: "string",
-          description: "対象 provider。 省略で 既存値維持、 明示 null で 全 provider に解除",
+          description: "対象 provider。 省略で 既存値維持。 フィルター解除は この tool からは不可 (= 必要なら delete_alert + create_alert で作り直す)",
           enum: ["openai", "anthropic", "gemini", "mistral"],
         },
         filterModel: {
           type: "string",
-          description: "対象 model (部分一致)。 省略で 既存値維持、 明示 null で 全 model に解除",
+          description: "対象 model (部分一致)。 省略で 既存値維持。 フィルター解除は この tool からは不可 (= 必要なら delete_alert + create_alert で作り直す)",
           maxLength: 128,
         },
         channelKinds: {
@@ -683,8 +712,8 @@ export const tools: Tool[] = [
         conditions: {
           type: "object",
           description:
-            "v1.5 multi-condition alert の更新。 指定すると 単 metric path を ignore し " +
-            "AND/OR 集約 path に switch。 既存の 単 metric / multi-condition の どちらにも上書き可能。",
+            "複合条件 alert (= multi-condition) の更新。 指定すると 単 metric 評価を ignore し " +
+            "AND/OR 集約に switch。 既存の 単 metric / multi-condition の どちらにも上書き可能。",
           required: ["operator", "conditions"],
           additionalProperties: false,
           properties: {
@@ -794,7 +823,7 @@ export const tools: Tool[] = [
       "を 一時 mute) と 異なり、 ack は 1 つの event 単位の受領印で 同 rule の再発火は 通常通り " +
       "受け取れる。 eventId は list_alert_events で 得た id を そのまま渡す。 既 ack の event を " +
       "再 ack しても 既存の ack 情報 (= 最初の acknowledgedAt / acknowledgedBy) を 上書きせず " +
-      "200 で carry (= idempotent、 alreadyAcknowledged フラグで 判別可)。",
+      "200 を返す (= idempotent、 alreadyAcknowledged フラグで 判別可)。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1003,12 +1032,12 @@ export const tools: Tool[] = [
   {
     name: "create_eval_criterion",
     description:
-      "自 account custom eval criterion を 1 件作成する (= Pro+ 専用、 v1.6 #13-2)。 " +
+      "自 account custom eval criterion を 1 件作成する (= Pro+ 専用)。 " +
       "name + rubric + scaleMin + scaleMax は必須。 同 account 内で 同 name 既存 = 409。 " +
       "global default と同 name は 構造的に重複可 (= UNIQUE (account_id, name) で account_id IS NULL と分離)。 " +
       "type 既定は 'llm_judge' (= judge LLM 採点)。 type に決定的評価器 (exact_match / contains / regex / json_schema / json_path) を " +
       "指定すると LLM を呼ばず無料・即時で採点 (= pass→scaleMax / fail→scaleMin)。 決定的 type は config 必須。 " +
-      "AI agent が dogfood eval で 「この基準を追加」 と判断した時の axis 1 path。",
+      "AI agent が 自分の workload を 評価する中で 「この基準を追加」 と判断した時に使う。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1023,7 +1052,7 @@ export const tools: Tool[] = [
         },
         rubric: {
           type: "string",
-          description: "scoring rubric 本文 (= 10-2000 文字、 judge LLM が score の根拠とする narrative。 決定的評価器でも人間向け説明として必須)",
+          description: "scoring rubric 本文 (= 10-2000 文字、 judge LLM が score の根拠とする 説明文。 決定的評価器でも人間向け説明として必須)",
           minLength: 10,
           maxLength: 2000,
         },
@@ -1146,7 +1175,7 @@ export const tools: Tool[] = [
   {
     name: "get_llm_budget",
     description:
-      "現在の LLM feature 月予算 (= safety classifier + PII 二次 audit + eval baseline runner の 3 軸 LLM cost cap) を取得する (= v1.6 #13-7)。 " +
+      "現在の LLM feature 月予算 (= safety classifier + PII 二次 audit + eval baseline runner の 3 軸 LLM cost cap) を取得する。 " +
       "response = { budgetUsd, spentUsd, remainingUsd, periodStart, defaultBudgetUsd, minBudgetUsd, maxBudgetUsd }。 " +
       "Free / Pro+ 共通で読み取り可能、 「予算 80% 到達したか?」 「raise すべきか?」 を AI agent が 判断する path で使う。 " +
       "default = $5/月、 月跨ぎ (= YYYY-MM 単位) で 自動 reset。",
@@ -1159,10 +1188,10 @@ export const tools: Tool[] = [
   {
     name: "raise_llm_budget",
     description:
-      "LLM feature 月予算 を 引き上げる / 引き下げる (= Pro+ 専用、 v1.6 #13-7)。 " +
-      "range = $5 - $500 (= hard cap で runaway 防御)、 0.01 USD 単位。 既存 spent は そのまま carry、 月跨ぎ で 自動 reset。 " +
+      "LLM feature 月予算 を 引き上げる / 引き下げる (= Pro+ 専用)。 " +
+      "range = $5 - $500 (= hard cap で runaway 防御)、 0.01 USD 単位。 既存 spent は そのまま維持、 月跨ぎ で 自動 reset。 " +
       "用例: 「予算が 80% 到達した、 今月だけ $30 に上げて」 / 「使いすぎたから来月は $10 に下げて」。 " +
-      "新規 値 < 現 spent でも accept (= remaining が 0 になるだけ、 月跨ぎで 0 から計上 carry)。",
+      "新規 値 < 現 spent でも accept (= remaining が 0 になるだけ、 月跨ぎで 0 から計上し直す)。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1180,7 +1209,7 @@ export const tools: Tool[] = [
   {
     name: "get_budget_gate",
     description:
-      "runtime 予算ゲート (= ランタイム制御プレーン Phase 1) の設定一覧 + 当月 LLM 消費額を取得する。 " +
+      "runtime 予算ゲート (= ランタイム制御プレーンの一部) の設定一覧 + 当月 LLM 消費額を取得する。 " +
       "response = { gates: [{ id, projectId, monthlyLimitUsd, enforceMode, enabled, ... }], spentUsdThisMonth, monthStart, ttlSeconds }。 monthStart は UTC 月初 (= JST では月初日 09:00 にリセット)。 " +
       "SDK の budgetGate opt-in が実行前に評価するのと同じ source。 get_llm_budget (= Argosvix 内部 AI 機能の費用 cap) とは別物で、 こちらは user 自身の LLM 支出の月次上限。 " +
       "用例: 「今月の予算ゲートの残りは?」 「ゲートは fail_open になってる?」",
@@ -1285,7 +1314,7 @@ export const tools: Tool[] = [
   {
     name: "request_approval",
     description:
-      "人間承認ゲート (= ランタイム制御プレーン Phase 3) に承認依頼を作成する (= Pro+ 専用)。 危険操作 (削除 / 送金 / 退会等) の前に呼ぶと account owner へ email 通知が飛び、 人間が dashboard か email link で承認 / 否認する。 " +
+      "人間承認ゲート (= ランタイム制御プレーンの一部) に承認依頼を作成する (= Pro+ 専用)。 危険操作 (削除 / 送金 / 退会等) の前に呼ぶと account owner へ email 通知が飛び、 人間が dashboard か email link で承認 / 否認する。 " +
       "重要: 承認 / 否認を実行する MCP tool は存在しない (= AI agent は自分の依頼を自己承認できない)。 結果は get_approval で polling して確認する。 " +
       "timeoutSeconds (default 3600) 切れは expired = 否認扱い。 " +
       "server-side 消費: 危険 mutation tool (bulk_delete_calls / purge_expired_plaintext / retry_failed_webhook / auto_silence_noisy_alert / extend_customer_trial / apply_promo_code_to_customer) に approvalId を渡すと backend が action 一致 + approved + 期限内 + 未消費を検証して実行時に消費する (= 1 approval = 1 実行)。 この場合 action は対象 tool 名と完全一致で作成すること。 " +
@@ -1351,7 +1380,7 @@ export const tools: Tool[] = [
   {
     name: "get_policy_gate",
     description:
-      "runtime ポリシーゲート (= ランタイム制御プレーン Phase 2) の設定を取得する。 " +
+      "runtime ポリシーゲート (= ランタイム制御プレーンの一部) の設定を取得する。 " +
       "response = { policy: { id, modelAllowlist, blockPii, blockSecrets, enforceMode, enabled, ... } | null }。 " +
       "SDK の policyGate opt-in が LLM 呼び出し前にローカル評価する設定 (= モデル allowlist 完全一致 + PII / secret 検知で block)。 " +
       "用例: 「いまのモデル制限は?」 「PII block は有効?」",
@@ -1446,7 +1475,7 @@ export const tools: Tool[] = [
   {
     name: "test_webhook",
     description:
-      "指定 URL に 1 件 fabricated alert を 試送する (= Pro+ 専用、 v1.6 #13-5)。 " +
+      "指定 URL に 1 件 fabricated alert を 試送する (= Pro+ 専用)。 " +
       "user が webhook URL を 登録する 前 に 「届くか」 を 確認する 主用途。 " +
       "SSRF 防御で https 必須 + private / loopback / cloud metadata IP は reject。 " +
       "secret 指定時は HMAC-SHA256 署名 (= X-Argosvix-Signature) を 添付。 " +
@@ -1486,8 +1515,8 @@ export const tools: Tool[] = [
       "global default (= account_id IS NULL) は 構造防御で対象外 = 404、 他 account も 404。 " +
       "⚠ 過去全 eval_run の 該当 criterion score 行 (= eval_scores) も ON DELETE CASCADE で 同時に物理削除される、 " +
       "履歴比較や score 推移分析が 永久に不可になる。 " +
-      "AI agent が 「criterion 整理」 で 軽い気持ちで 呼ぶ tool ではない、 過去 run の 該当 score が要らないと user が明示確認した時のみ carry。 " +
-      "rename したい だけ なら update_eval_criterion (= full replace) で name + rubric + scaleMin + scaleMax を carry する 方が 履歴を 失わずに 済む。",
+      "AI agent が 「criterion 整理」 で 軽い気持ちで 呼ぶ tool ではない、 過去 run の 該当 score が要らないと user が明示確認した時のみ実行する。 " +
+      "rename したい だけ なら update_eval_criterion (= full replace) で name + rubric + scaleMin + scaleMax を 渡す 方が 履歴を 失わずに 済む。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1549,7 +1578,7 @@ export const tools: Tool[] = [
     description:
       "外向き event webhook を部分更新する (= Pro+ 専用、 PATCH /v1/webhooks/:id)。 " +
       "指定した field のみ変更(url / secret / eventTypes / description / enabled)。 " +
-      "secret を null で送ると署名解除、 enabled=true で再有効化すると連続失敗カウンタもリセット。 " +
+      "secret は省略で 既存値維持、 空文字 \"\" を送ると署名解除 (= null は schema 上送れない)。 enabled=true で再有効化すると連続失敗カウンタもリセット。 " +
       "他 account の webhook は 404。 webhookId は list_webhooks の id。",
     inputSchema: {
       type: "object",
@@ -1558,7 +1587,7 @@ export const tools: Tool[] = [
       properties: {
         webhookId: { type: "string", description: "対象 webhook の id (= owh_...)" },
         url: { type: "string", description: "新 URL(HTTPS 必須)" },
-        secret: { type: "string", description: "新 secret(空 / null で解除)" },
+        secret: { type: "string", description: "新 secret。 省略で 既存値維持、 空文字 \"\" で署名解除(null は送れない)" },
         eventTypes: {
           type: "array",
           description: "購読 event 種別の配列(空 = 全件)",
@@ -1589,9 +1618,9 @@ export const tools: Tool[] = [
   {
     name: "list_prompts",
     description:
-      "user が登録した prompt template の一覧を返す (= migration 0038 prompt_registry、 v1.5 Round F)。 " +
+      "user が登録した prompt template の一覧を返す。 " +
       "各 prompt は id / name / version / template / variables / labels / description / createdAt を含む。 " +
-      "「production」 等の label で filter (= ?label=xxx) ま と は 同 name の全 version 取得 " +
+      "「production」 等の label で filter (= ?label=xxx) または 同 name の全 version 取得 " +
       "(= ?name=xxx) が可能。 上限 200 件、 sort = name ASC + created_at DESC。 user が dashboard で " +
       "登録した prompt を AI agent が 直接読んで 使う 主要 path。",
     inputSchema: {
@@ -1640,9 +1669,9 @@ export const tools: Tool[] = [
   {
     name: "create_prompt",
     description:
-      "新 prompt template を 1 件登録する (= Pro+ 専用、 v1.6 #13-1)。 name + version + template が 必須、 " +
+      "新 prompt template を 1 件登録する (= Pro+ 専用)。 name + version + template が 必須、 " +
       "variables / labels / description は 任意。 同 (name, version) が 既存 = 409 を 返す (= UNIQUE 制約)。 " +
-      "AI agent が dogfood eval / experiment 用に template を 自動登録する path で 使う。",
+      "AI agent が eval / experiment 用の template を 自動登録する path で 使う。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1707,7 +1736,7 @@ export const tools: Tool[] = [
         },
         variables: {
           type: "object",
-          description: "新 variables (= plain object、 null で 全消し)。",
+          description: "新 variables (= plain object)。 省略で 既存値維持 (= null は schema 上送れない)。 全消ししたい場合は 空 object {} を渡す (= 空の variables で上書き)。",
           additionalProperties: true,
         },
         labels: {
@@ -1718,7 +1747,7 @@ export const tools: Tool[] = [
         },
         description: {
           type: "string",
-          description: "新 description (= 1-500 文字)。 既存 description を 明示的に clear したい場合は この field を 渡さずに 他 field のみ で PATCH する (= 空文字 '' は schema 拒否、 LLM の hallucination で 既存 description が 消える 事故防止)。",
+          description: "新 description (= 1-500 文字)。 省略すると 既存 description を維持。 空文字 '' は schema 拒否 (= LLM の hallucination で 既存 description が 消える 事故防止)。 既存 description の clear は この tool からは 不可。",
           minLength: 1,
           maxLength: 500,
         },
@@ -1760,7 +1789,7 @@ export const tools: Tool[] = [
       "既存 prompt を 削除する (= Pro+ 専用、 DELETE /v1/prompts/:id、 204 No Content)。 " +
       "自 account scope (= 他 account の id は 404)。 ⚠ 物理削除な ので 復元不可、 " +
       "過去の eval_runs の prompt_registry_id は SET NULL になり 「どの prompt template で run したか」 の trace が失われる (= 履歴比較で 紐付き 不可)。 " +
-      "AI agent は 「rotation で 旧 version を sunset」 で 使う 場合 でも、 過去 run trace が 残っている うちは update_prompt で labels を 'sunset' 等に carry して論理 sunset する 方が安全。",
+      "AI agent は 「rotation で 旧 version を sunset」 で 使う 場合 でも、 過去 run trace が 残っている うちは update_prompt で labels を 'sunset' 等に 付け替えて 論理 sunset する 方が安全。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1861,7 +1890,7 @@ export const tools: Tool[] = [
       "source は 'cron' (= 定期 batch) / 'mcp' (= classify_calls_batch on-demand) / 'human_override' / 'api' / 'auto' を含む。 " +
       "callId 指定 = 同 call の 全 classifier assessment、 callId 省略 = 自 account 全体で flagged 優先 + 直近 ORDER。 " +
       "OPENAI_API_KEY 未 provision の environment では cron が走らず空配列 (= classify_calls_batch も 503)。 " +
-      "前提: safety classification は既定では無効 (= founder-scoped / off-by-default) で、 有効化されるまで assessment は生成されない。 " +
+      "前提: safety classification は既定では無効 (= サービス側で段階的に有効化する切替) で、 自 account で有効化されるまで assessment は生成されない。 " +
       "空配列は「故障」ではなく「未有効化 / flagged 該当なし」を意味する。 " +
       "AI agent は 「最近 flagged な call の review」 や 「特定 call の policy 違反候補確認」 path で使う。",
     inputSchema: {
@@ -1926,7 +1955,7 @@ export const tools: Tool[] = [
     name: "get_eval_run",
     description:
       "指定 eval run の detail + 各 (criterion × call) score 一覧 を 取得する。 id は list_eval_runs の runs[].id を そのまま使う。 " +
-      "scores 配列に score (= criterion scale 内 integer) + reasoning (= judge の理由 narrative) を含む。 " +
+      "scores 配列に score (= criterion scale 内 integer) + reasoning (= judge の理由説明) を含む。 " +
       "argosvix://eval-runs/{id} resource template と 同 endpoint。",
     inputSchema: {
       type: "object",
@@ -1945,7 +1974,7 @@ export const tools: Tool[] = [
     name: "get_percentiles",
     description:
       "calls の percentile metrics を 取得 (= POST /v1/query/percentiles)。 metric = 'latency' (= レイテンシ ms) or 'cost' (= USD)、 全期間 1 数値 or groupBy='day'/'hour'/'minute' で 時系列 series。 " +
-      "AI agent が 「先週の p95 latency 推移を 日次で」 narrative で carry。 D1 SQLite (= percentile_cont 不在) で window function 経由 nearest-rank 法 計算。",
+      "「先週の p95 latency 推移を 日次で」 のような依頼に 1 call で答えられる。 percentile は nearest-rank 法で計算。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1979,7 +2008,7 @@ export const tools: Tool[] = [
     name: "list_projects",
     description:
       "自 account の active projects を 一覧取得 (= GET /v1/projects、 archived 除外)。 " +
-      "v1.5 project switcher narrative で、 AI agent が 「dev / staging / prod 環境別 観測」 carry。 Pro 5 件 / Team unlimited、 Free は default のみ。",
+      "dev / staging / prod のような 環境別の観測に使う。 Pro 5 件 / Team unlimited、 Free は default のみ。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2056,7 +2085,7 @@ export const tools: Tool[] = [
     name: "delete_project",
     description:
       "project を soft delete (= DELETE /v1/projects/:id、 archived_at 設定で 論理削除)。 default project は 削除不可 (= accounts.default_project_id 参照 整合 のため 400)。 " +
-      "archived 後 calls / alerts は そのまま (= 過去観測は keep)、 新規 record は 別 project に carry する narrative。",
+      "archived 後 calls / alerts は そのまま (= 過去観測は keep)、 新規 record は 別 project に 振り分ける 運用。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2074,8 +2103,8 @@ export const tools: Tool[] = [
   {
     name: "classify_calls_batch",
     description:
-      "未 classified な calls を on-demand で 一括 safety classify (= OpenAI Moderation 経由、 POST /v1/safety-assessments/scan-batch)。 cron (= 15 分間隔 50 件) を 「今すぐ」 補完する narrative。 axis 4 Tier 1 = AI agent が 「先週分の全 call を まとめて 分類して」 narrative で 1 prompt 完結。 " +
-      "Pro+ plan 限定 (= Free は cron に任せる)、 backend で plan gate + budget gate carry。 maxRecords (= 1-100、 default 50)、 返却 = { scanned, assessed, flagged, failures, skipped }。 source='mcp' で carry (= cron 由来と 区別、 dashboard で 「on-demand 分類」 視覚化 path)。 " +
+      "未 classified な calls を on-demand で 一括 safety classify (= OpenAI Moderation 経由、 POST /v1/safety-assessments/scan-batch)。 cron (= 15 分間隔 50 件) を 「今すぐ」 補完する path で、 AI agent が 「先週分の全 call を まとめて 分類して」 を 1 prompt で完結できる。 " +
+      "Pro+ plan 限定 (= Free は cron に任せる)、 backend で plan gate + budget gate を enforce。 maxRecords (= 1-100、 default 50)、 返却 = { scanned, assessed, flagged, failures, skipped }。 source='mcp' で 記録 (= cron 由来と 区別、 dashboard で 「on-demand 分類」 を 視覚化できる)。 " +
       "監査 = safety.scan_batch_run event を audit_log に emit。",
     inputSchema: {
       type: "object",
@@ -2094,9 +2123,9 @@ export const tools: Tool[] = [
   {
     name: "propose_eval_criteria",
     description:
-      "useCaseHint (= 「カスタマーサポート bot」 等 1 行) と 任意の sampleCallIds (= 自 account の 代表 call、 最大 5 件) を 元に、 LLM-judge (= gpt-4o-mini) が eval criterion 候補を 提案 (= POST /v1/eval-criteria/propose)。 axis 4 Tier 1 closing = AI agent が 「うちの prompt の品質を測る criterion を提案して」 narrative で 1 prompt 完結。 " +
-      "Pro+ plan 限定 (= backend で plan gate + budget gate carry)、 INSERT しない (= 「propose」 軸、 user 採用判断は create_eval_criterion で別 step、 LLM hallucination 影響は構造的に限定)。 sampleCallIds の decrypt 失敗は partialFailures に narrative carry (= sample なしでも LLM call は走る)。 " +
-      "【prompt sample のプライバシー軸】 sampleCallIds 指定時は backend で 該当 call の prompt/response 復号 → OpenAI gpt-4o-mini に excerpt (各 1500 char cap) を 送信する。 user の SDK が 元々 OpenAI/Anthropic に 送ったデータの 再送信なので 新規 vendor は 増えないが、 「自社 LLM call と異なる OpenAI モデル」 に 渡る軸として 認識する。 sample 軸の心配がある場合は sampleCallIds なしで useCaseHint のみで 走らせる選択肢。 " +
+      "useCaseHint (= 「カスタマーサポート bot」 等 1 行) と 任意の sampleCallIds (= 自 account の 代表 call、 最大 5 件) を 元に、 LLM-judge (= gpt-4o-mini) が eval criterion 候補を 提案 (= POST /v1/eval-criteria/propose)。 AI agent が 「うちの prompt の品質を測る criterion を提案して」 を 1 prompt で完結できる。 " +
+      "Pro+ plan 限定 (= backend で plan gate + budget gate を enforce)、 INSERT しない (= 「propose」 のみ、 user 採用判断は create_eval_criterion で別 step、 LLM hallucination 影響は構造的に限定)。 sampleCallIds の decrypt 失敗は partialFailures に 報告 (= sample なしでも LLM call は走る)。 " +
+      "【prompt sample のプライバシー軸】 sampleCallIds 指定時は backend で 該当 call の prompt/response 復号 → OpenAI gpt-4o-mini に excerpt (各 1500 char cap) を 送信する。 元の call が OpenAI 宛てなら同 vendor への再送信だが、 Gemini / Mistral など他 provider の call を sample に指定した場合は その内容が OpenAI に 新規に渡る点に 注意。 sample 軸の心配がある場合は sampleCallIds なしで useCaseHint のみで 走らせる選択肢。 " +
       "【結果は advisory】 返却 criteria は LLM の 提案 で、 構造的に valid でも 意味的に 弱い rubric (= 「helpful」 過剰多用 / 重複)が混ざる可能性。 採用前に user 確認推奨、 create_eval_criterion に blind 投入は NG。 " +
       "返却 = { criteria: [{ name (snake_case 32 chars), rubric (1-200), scaleMin (=1), scaleMax (5 or 10), reasoning (1-200) }], partialFailures: string[], budgetSpentUsd, proposedRawCount (= LLM が返した raw 件数), droppedCount (= validator で 削除した件数) } 形式。 監査 = eval.propose_criteria event を audit_log に emit。",
     inputSchema: {
@@ -2112,7 +2141,7 @@ export const tools: Tool[] = [
         },
         sampleCallIds: {
           type: "array",
-          description: "context として 渡す 自 account の call_id 配列 (= 任意、 最大 5 件、 [A-Za-z0-9_-]{1,128})。 LLM 提案を 自分の data に grounded する narrative",
+          description: "context として 渡す 自 account の call_id 配列 (= 任意、 最大 5 件、 [A-Za-z0-9_-]{1,128})。 LLM の提案を 自分の data に grounding する",
           items: {
             type: "string",
             pattern: "^[A-Za-z0-9_-]{1,128}$",
@@ -2132,8 +2161,8 @@ export const tools: Tool[] = [
   {
     name: "purge_expired_plaintext",
     description:
-      "(axis 4 Tier 2 = 自律 AI ops 第一弾) 自 account の 平文 record のうち olderThanDays 経過したものを 一括 purge (= POST /v1/tier2/plaintext/purge-expired)。 利用規約 v2.1 narrative の 「90 日 まで 保管可能」 と整合 (= 自動 retention narrative)、 AI agent が 「30 日 経過の 平文 data を 自動 purge」 narrative で 1 prompt 完結。 " +
-      "dryRun=true (= safety default narrative) で count + sample 5 件の call_id を 返す、 dryRun=false で 実 UPDATE。 emit → UPDATE 順序 + deterministic idempotencyId (= sha1(endpoint+accountId+olderThanDays+cutoff_date)) で webhook retry 同等 narrative。 **Pro+ プラン限定 (= 2026-06-12 解放、 Free は 403)。 実 purge (dryRun=false) は approvalId 必須** = request_approval (action: 'purge_expired_plaintext') で人間承認を取ってから実行する (= 平文 NULL 化は不可逆のため)。 自 account のみ purge。 " +
+      "自 account の 平文 record のうち olderThanDays 経過したものを 一括 purge (= POST /v1/tier2/plaintext/purge-expired)。 利用規約 v2.1 の 「90 日 まで 保管可能」 と整合する 自動 retention で、 AI agent が 「30 日 経過の 平文 data を 自動 purge」 を 1 prompt で完結できる。 " +
+      "dryRun=true (= 迷ったら選ぶ safe 側) で count + sample 5 件の call_id を 返す、 dryRun=false で 実 UPDATE。 emit → UPDATE 順序 + deterministic idempotencyId (= sha1(endpoint+accountId+olderThanDays+cutoff_date)) で webhook retry 同等の semantics。 **Pro+ プラン限定 (= Free は 403)。 実 purge (dryRun=false) は approvalId 必須** = request_approval (action: 'purge_expired_plaintext') で人間承認を取ってから実行する (= 平文 NULL 化は不可逆のため)。 自 account のみ purge。 " +
       "返却 dryRun=true = { dryRun: true, targetCount, cutoffTimestamp, olderThanDays, sampleTargetCallIds }、 dryRun=false = { dryRun: false, purgedCount, cutoffTimestamp, olderThanDays, purgedAt }。 audit = tier2.purge_expired_plaintext を emit。",
     inputSchema: {
       type: "object",
@@ -2141,7 +2170,7 @@ export const tools: Tool[] = [
       properties: {
         olderThanDays: {
           type: "integer",
-          description: "purge 対象の経過日数 (= 1-365、 default 30、 利用規約 v2.1 narrative と整合)",
+          description: "purge 対象の経過日数 (= 1-365、 default 30、 利用規約 v2.1 と整合)",
           minimum: 1,
           maximum: 365,
           default: 30,
@@ -2163,9 +2192,9 @@ export const tools: Tool[] = [
   {
     name: "retry_failed_webhook",
     description:
-      "(axis 4 Tier 2 = 自律 AI ops 第一弾) 失敗した Stripe webhook event (= billing_dead_letter テーブル) を 再処理 marker として audit log に carry (= POST /v1/tier2/webhook-events/retry)。 「先週 Stripe webhook が 一時失敗してた件を 全部 retry して」 narrative で 1 prompt 完結。 " +
-      "eventIds (= 特定 event 単体、 最大 100 件) ま た は fromTimestamp/toTimestamp (= range、 7 日 cap) で 対象 select。 dryRun=true で list preview、 dryRun=false で 各 event を audit log に 「marked_for_manual_redispatch」 narrative で 残す (= founder が wrangler / Stripe dashboard 経由で 実 retry を carry する 軸、 完全 auto re-dispatch は v1.8 carry)。 " +
-      "emit は deterministic idempotencyId (= sha1(endpoint+accountId+eventId)) で carry、 同 args の 二重実行は silent skip。 **founder 運用限定 (= 内部の決済 webhook 復旧ツール、 一般 account は 403)**。 billing_dead_letter は account 横断の内部 table で、 実 re-dispatch も手動運用前提のため一般開放の予定はない。 " +
+      "失敗した Stripe webhook event (= billing_dead_letter テーブル) を 再処理 marker として audit log に記録する (= POST /v1/tier2/webhook-events/retry)。 「先週 Stripe webhook が 一時失敗してた件を 全部 retry して」 を 1 prompt で完結できる。 " +
+      "eventIds (= 特定 event 単体、 最大 100 件) または fromTimestamp/toTimestamp (= range、 7 日 cap) で 対象 select。 dryRun=true で list preview、 dryRun=false で 各 event を audit log に 「marked_for_manual_redispatch」 として 残す (= 実 retry は Argosvix 運営が手動で実施、 完全自動 re-dispatch は今後の対応予定)。 " +
+      "emit は deterministic idempotencyId (= sha1(endpoint+accountId+eventId)) を使い、 同 args の 二重実行は silent skip。 **内部運用ツール (= 決済 webhook 復旧用、 customer account は 403)**。 billing_dead_letter は account 横断の内部 table で、 実 re-dispatch も手動運用前提のため一般開放の予定はない。 " +
       "返却 dryRun=true = { dryRun: true, targetCount, events: [{eventId, eventType, reason, receivedAt}] }、 dryRun=false = { dryRun: false, targetCount, succeeded: string[], failed: [{eventId, reason}], skipped: string[], narrative, retriedAt }。 audit = tier2.retry_failed_webhook を 各 event 毎に emit。",
     inputSchema: {
       type: "object",
@@ -2211,9 +2240,9 @@ export const tools: Tool[] = [
   {
     name: "auto_silence_noisy_alert",
     description:
-      "(axis 4 Tier 2 = 自律 AI ops 第二弾) 過去 1 時間 で 一定回数以上 firing している noisy alert を 一括 silence (= POST /v1/tier2/alerts/auto-silence)。 「同じ alert が 1 時間 で 50 回 鳴ってる、 1 時間 silence して」 narrative で 1 prompt 完結。 " +
-      "alertId (= 単体 silence) ま た は byVolumeThreshold (= 1 時間 N+ 回 firing の alerts 全部) の どちらか一方 を 指定。 silenceDurationMinutes は 5-1440 (= 5 分〜24 時間)、 default 60 分。 reason narrative も 付随可能。 " +
-      "dryRun=true で 対象 list + fireCount preview、 dryRun=false で UPDATE alerts.silenced_until + audit emit per alert (= tier2.auto_silence_noisy_alert event)。 reversible mutation 軸 (= 既存 unsilence_alert で 解除可能) + per-account 完全 scoping (= 他 account の alert は 影響なし) のため founder gate なし、 paid Pro+ user で 直接 carry 可能。 " +
+      "過去 1 時間 で 一定回数以上 firing している noisy alert を 一括 silence (= POST /v1/tier2/alerts/auto-silence)。 「同じ alert が 1 時間 で 50 回 鳴ってる、 1 時間 silence して」 を 1 prompt で完結できる。 " +
+      "alertId (= 単体 silence) または byVolumeThreshold (= 1 時間 N+ 回 firing の alerts 全部) の どちらか一方 を 指定。 silenceDurationMinutes は 5-1440 (= 5 分〜24 時間)、 default 60 分。 reason も 付随可能。 " +
+      "dryRun=true で 対象 list + fireCount preview、 dryRun=false で UPDATE alerts.silenced_until + audit emit per alert (= tier2.auto_silence_noisy_alert event)。 reversible な mutation (= 既存 unsilence_alert で 解除可能) + per-account 完全 scoping (= 他 account の alert は 影響なし) のため 特別な権限は不要、 Pro+ user が 直接呼び出せる。 " +
       "返却 dryRun=true = { dryRun: true, targetCount, silenceUntil, silenceDurationMinutes, lookbackStart, targets: [{alertId, name, fireCount}] }、 dryRun=false = { dryRun: false, targetCount, silenceUntil, silenceDurationMinutes, succeeded: string[], failed: [{alertId, reason}], skipped: string[], reason }。 idempotencyId = sha1(endpoint+accountId+alertId+silenceUntil の 分単位) で 同 minute 内の 二重実行を coalesce。",
     inputSchema: {
       type: "object",
@@ -2240,7 +2269,7 @@ export const tools: Tool[] = [
         },
         reason: {
           type: "string",
-          description: "silence 理由 (= audit log に carry、 200 char 上限)",
+          description: "silence 理由 (= audit log に記録、 200 char 上限)",
           maxLength: 200,
         },
         dryRun: {
@@ -2260,9 +2289,9 @@ export const tools: Tool[] = [
   {
     name: "extend_customer_trial",
     description:
-      "(axis 4 Tier 2 = 自律 AI ops 第三弾) 自 account の Stripe subscription trial 期間を 1-30 日 延長 (= POST /v1/tier2/trial/extend)。 **founder 運用限定 (= サポート用の内部ツール、 一般 account は 403)**。 trial 延長は収益に直結するため一般開放の予定はない。 累計 60 日 上限 (= 過去 30 日 audit 集計)、 status='trialing' でなければ 409。 " +
-      "R39 carry = dryRun は 必須明示 (= 暗黙 false で mutation する事故 防御)、 dryRun=false 時 は idempotencyKey も 必須 (16-128 alphanumeric+'_-')。 同 key 再呼び出しは tier2_idempotency table 経由で cached result 返却 (= retry double-extend を 構造防御)。 " +
-      "dryRun=true で previousTrialEnd / newTrialEnd / 累計 narrative preview のみ (= Stripe call なし)。 dryRun=false で 実 Stripe mutation + accounts_subscription 同期 update。",
+      "自 account の Stripe subscription trial 期間を 1-30 日 延長 (= POST /v1/tier2/trial/extend)。 **内部運用ツール (= サポート用、 customer account は 403)**。 trial 延長は収益に直結するため一般開放の予定はない。 累計 60 日 上限 (= 過去 30 日 audit 集計)、 status='trialing' でなければ 409。 " +
+      "dryRun は 必須明示 (= 暗黙 false で mutation する事故 防御)、 dryRun=false 時 は idempotencyKey も 必須 (16-128 alphanumeric+'_-')。 同 key 再呼び出しは tier2_idempotency table 経由で cached result 返却 (= retry double-extend を 構造防御)。 " +
+      "dryRun=true で previousTrialEnd / newTrialEnd / 累計の preview のみ (= Stripe call なし)。 dryRun=false で 実 Stripe mutation + accounts_subscription 同期 update。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2282,7 +2311,7 @@ export const tools: Tool[] = [
         },
         reason: {
           type: "string",
-          description: "延長 理由 (= audit log に carry、 必須、 200 char 上限)",
+          description: "延長 理由 (= audit log に記録、 必須、 200 char 上限)",
           minLength: 1,
           maxLength: 200,
         },
@@ -2309,9 +2338,9 @@ export const tools: Tool[] = [
   {
     name: "apply_promo_code_to_customer",
     description:
-      "(axis 4 Tier 2 = 自律 AI ops 第三弾) 自 account の Stripe subscription に user-facing promotion code (= 既 Stripe で 登録済の 「LAUNCH50」 等) を 適用 (= POST /v1/tier2/promo/apply)。 **founder 運用限定 (= サポート用の内部ツール、 一般 account は 403)**。 経済影響のある操作の規約整備とセットでないと開放しない方針 (= 解放未定)。 既 active discount があれば 409 (= 重ね掛け 構造防御)、 status が canceled / incomplete_expired は 409。 " +
-      "R39 carry = promotion_code 経由で Stripe redeem 判定を委ねる構造 (= coupon 直接適用は 制約 bypass で禁止)、 dryRun 必須明示 + dryRun=false 時 idempotencyKey 必須。 同 key 再呼び出しは tier2_idempotency table 経由で cached result 返却、 concurrent apply を 構造直列化。 " +
-      "dryRun=true で resolve + 既 active 判定 + 推定 割引 narrative preview のみ (= Stripe mutation なし)。 dryRun=false で 実 promotion_code 適用。",
+      "自 account の Stripe subscription に user-facing promotion code (= 既 Stripe で 登録済の 「LAUNCH50」 等) を 適用 (= POST /v1/tier2/promo/apply)。 **内部運用ツール (= サポート用、 customer account は 403)**。 経済影響のある操作の規約整備とセットでないと開放しない方針 (= 解放未定)。 既 active discount があれば 409 (= 重ね掛け 構造防御)、 status が canceled / incomplete_expired は 409。 " +
+      "promotion_code 経由で Stripe redeem 判定を委ねる構造 (= coupon 直接適用は 制約 bypass で禁止)、 dryRun 必須明示 + dryRun=false 時 idempotencyKey 必須。 同 key 再呼び出しは tier2_idempotency table 経由で cached result 返却、 concurrent apply を 構造直列化。 " +
+      "dryRun=true で resolve + 既 active 判定 + 推定割引の preview のみ (= Stripe mutation なし)。 dryRun=false で 実 promotion_code 適用。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2332,7 +2361,7 @@ export const tools: Tool[] = [
         },
         reason: {
           type: "string",
-          description: "適用 理由 (= audit log に carry、 必須、 200 char 上限)",
+          description: "適用 理由 (= audit log に記録、 必須、 200 char 上限)",
           minLength: 1,
           maxLength: 200,
         },
@@ -2359,9 +2388,9 @@ export const tools: Tool[] = [
   {
     name: "detect_anomaly",
     description:
-      "現 window と baseline window (= 同 length の 1 期前) を 比較して cost / latency / error_rate / call_volume の 4 軸で 異常を検出 (= axis 4 Tier 1 = AI が 1 prompt で 「何か変なことが起きてないか」 把握)。 " +
-      "threshold で 感度 調整可能: sensitive (= 1.5×) / normal (= 2×、 default) / conservative (= 3×)。 detection 数 0-4 件、 各 anomaly は narrative 付き。 " +
-      "返却 = { window, threshold, current: {...}, baseline: {...}, anomalies: [{ axis, severity: 'minor'|'major'|'critical', current, baseline, ratio, narrative }] } 形式。 errorRate は percent (0-100) で 評価 + 表示 (= backend aggregate と同 単位)。 baseline data 不足 (= 期間 record < 10) は anomalies: [] + warning narrative で carry。",
+      "現 window と baseline window (= 同 length の 1 期前) を 比較して cost / latency / error_rate / call_volume の 4 軸で 異常を検出 (= AI が 1 prompt で 「何か変なことが起きてないか」 を把握できる)。 " +
+      "threshold で 感度 調整可能: sensitive (= 1.5×) / normal (= 2×、 default) / conservative (= 3×)。 detection 数 0-4 件、 各 anomaly は 説明文 (narrative) 付き。 " +
+      "返却 = { window, threshold, multiplier (= threshold の倍率数値), current: {...}, baseline: {...}, anomalies: [{ axis, severity: 'minor'|'major'|'critical', current, baseline, ratio, narrative }], partialFailures?: string[] (= 'current:xxx' / 'baseline:xxx' 形式で 取得に失敗した軸、 全成功時は省略) } 形式。 errorRate は percent (0-100) で 評価 + 表示 (= backend aggregate と同 単位)。 baseline data 不足 (= 期間 record < 10) は anomalies: [] + warning message を返す (= この経路は multiplier を含まず、 partialFailures は同様に optional)。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2384,9 +2413,9 @@ export const tools: Tool[] = [
   {
     name: "propose_alert_rules",
     description:
-      "過去 lookbackDays (= 7-30、 default 14) の calls pattern を 分析して、 cost / latency / error_rate / anomaly の 推奨 alert rule を JSON 提案 (= axis 4 Tier 1 = AI が baseline 設計)。 " +
-      "適用は customer 確認後 create_alert で別 step (= propose のみ、 副作用ゼロ)。 既存 alerts と被らない rule のみ 提案 (= list_alerts で 既存 type を fetch)。 " +
-      "返却 = { lookbackDays, baseline: {meanDailyCost (= USD), p95Latency (= ms), errorRate (= percent 0-100), dailyCalls, totalCalls}, proposals: [{ name, alertType, thresholdValue, windowMinutes, reasoning }], skipped: [{ alertType, reason }] } 形式。 error_rate proposal の thresholdValue も percent (= backend create_alert と整合)。 大手 dashboard が UI で 表示する 軸を MCP-first で 1 prompt 完結。",
+      "過去 lookbackDays (= 7-30、 default 14) の calls pattern を 分析して、 cost / latency / error_rate / anomaly の 推奨 alert rule を JSON で提案する。 " +
+      "適用は customer 確認後 create_alert で別 step (= propose のみ、 副作用ゼロ)。 既存 alerts と同 type の rule は原則提案しない (= list_alerts で 既存 type を fetch。 ただし list_alerts の取得に失敗した場合は 既存集合を空として扱うため、 既存 alert と重複する提案が返り得る。 失敗軸は partialFailures で報告)。 " +
+      "返却 = { lookbackDays, baseline: {meanDailyCost (= USD), p95Latency (= ms), errorRate (= percent 0-100), dailyCalls, totalCalls}, proposals: [{ name, alertType, thresholdValue, windowMinutes, reasoning }], skipped: [{ alertType, reason }], partialFailures?: string[] (= 取得に失敗した軸、 全成功時は省略) } 形式。 error_rate proposal の thresholdValue も percent (= backend create_alert と整合)。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2404,9 +2433,9 @@ export const tools: Tool[] = [
   {
     name: "get_account_health",
     description:
-      "自社 LLM infra の健康状態 サマリを 1 call で取得 (= axis 4 Tier 1 = 自律 AI ops)。 既存 4 endpoint (= aggregate_calls / get_percentiles / get_llm_budget / list_audit_log) を 並列 fetch して 1 narrative response に圧縮。 " +
-      "返却 = { window, totals: {calls, costUsd, errorRate (= percent 0-100)}, latency: {p50, p95, p99 (= ms)}, budget: {used, limit, percentUsed (= 0-100)}, recentEvents: 件数, summary: 'ok' | 'warn' | 'critical' } 形式。 critical = errorRate≥10% / budget≥90% / p95≥10s、 warn = ≥3% / ≥70% / ≥3s。 " +
-      "AI agent narrative = 「今うちの LLM infra どう？」 を 1 prompt で carry。 backend 新 endpoint 不要 = 純 read aggregator。 個別 endpoint 失敗は partial で 返す (= 1 軸 timeout が summary を 止めない)。",
+      "自社 LLM infra の健康状態 サマリを 1 call で取得する。 既存 4 endpoint (= aggregate_calls / get_percentiles / get_llm_budget / list_audit_log) を 並列 fetch して 1 response に圧縮。 " +
+      "返却 = { window, totals: {calls, costUsd, errorRate (= percent 0-100)}, latency: {p50, p95, p99 (= ms)}, budget: {used, limit, percentUsed (= 0-100)}, recentEvents: 件数, summary: 'ok' | 'warn' | 'critical', partialFailures?: string[] (= 取得に失敗した軸、 全成功時は省略) } 形式。 critical = errorRate≥10% / budget≥90% / p95≥10s、 warn = ≥3% / ≥70% / ≥3s。 " +
+      "「今うちの LLM infra どう？」 を 1 prompt で答えられる。 純 read aggregator で、 個別 endpoint 失敗は partial で 返す (= 1 軸の timeout が summary を 止めず、 失敗軸は partialFailures に載る)。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2423,9 +2452,9 @@ export const tools: Tool[] = [
   {
     name: "aggregate_calls",
     description:
-      "calls の 集計 cube を 取得 (= POST /v1/query/aggregate)。 groupBy (= provider / model / day / hour / minute / tag / error) × metric (= cost / latency / tokens / input_tokens / output_tokens / cached_tokens / cache_savings / count / error_rate) で 1 call で AI agent が 「今月の cost を model 別 に集計」 narrative carry。 " +
+      "calls の 集計 cube を 取得 (= POST /v1/query/aggregate)。 groupBy (= provider / model / day / hour / minute / tag / error) × metric (= cost / latency / tokens / input_tokens / output_tokens / cached_tokens / cache_savings / count / error_rate) で、 AI agent が 「今月の cost を model 別 に集計」 を 1 call で完結できる。 " +
       "tag mode は tagKey 必須 (= alphanumeric + _ - のみ、 例: 'env' / 'feature')。 error mode は エラー行のみを error 文字列で種類別集計 (= どのエラーが何件か。 metric=count 推奨)。 hour mode は 168h / minute mode は 60min まで (= 超過 400)。 cost = SUM(cost_usd) / latency = AVG(latency_ms) / tokens = SUM(total_tokens) / input_tokens = SUM(prompt_tokens) / output_tokens = SUM(completion_tokens) / cached_tokens = SUM(cached_read_tokens) / cache_savings = SUM(cache_savings_usd) / count = COUNT(*) / error_rate = error ÷ total。 " +
-      "返却 = { groups: [{key, value, count}], total: {value, count} } 形式。 軸 1 操作系 + 自律 AI ops の 分析 narrative の coverage 拡張。",
+      "返却 = { groups: [{key, value, count}], total: {value, count} } 形式。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2466,8 +2495,8 @@ export const tools: Tool[] = [
   {
     name: "list_audit_log",
     description:
-      "Phase B audit log を 一覧 取得 (= GET /v1/audit-log)。 自 account 限定、 admin role のみ許可 (= viewer/member は 403)。 " +
-      "AI agent が 「最近の招待 / API key revoke / プロジェクト変更」 等の 操作履歴 を 自律参照する narrative (= axis 4 自律 AI ops)。 " +
+      "audit log を 一覧 取得 (= GET /v1/audit-log)。 自 account 限定、 admin role のみ許可 (= viewer/member は 403)。 " +
+      "AI agent が 「最近の招待 / API key revoke / プロジェクト変更」 等の 操作履歴 を 自律参照できる。 " +
       "filter = eventType (= 'invitation.created' / 'api_key.revoked' 等) / targetKind / actorUserId / from / to。 " +
       "cursor pagination 対応 (= nextCursor 形式 = 'created_at|id')、 max limit 200。",
     inputSchema: {
@@ -2513,7 +2542,7 @@ export const tools: Tool[] = [
     name: "list_saved_views",
     description:
       "保存済 saved views 一覧を 取得 (= GET /v1/saved-views)。 saved view = /calls page で よく使う filter (startDate/endDate/provider/model/limit) の組み合わせを 名前付きで 保存したもの。 " +
-      "AI agent は 「いつもの先週の OpenAI filter で 呼び出し見せて」 narrative で carry できる。 account 単位、 max 20 件。",
+      "AI agent は 「いつもの先週の OpenAI filter で 呼び出し見せて」 のような依頼に応えられる。 account 単位、 max 20 件。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2524,7 +2553,7 @@ export const tools: Tool[] = [
     name: "create_saved_view",
     description:
       "新規 saved view を 作成 / 同名なら上書き (= POST /v1/saved-views)。 name は account 内一意。 filter は SavedViewFilter shape (= startDate / endDate / provider / model / limit / preset / sortBy? / sortOrder?)。 " +
-      "AI agent が 自動で よく使う filter を 名前付き保存 narrative。 例: 「直近 7 日 GPT-4 のみ」 view を 作って 後で呼ぶ。",
+      "AI agent が よく使う filter を 名前付きで保存できる。 例: 「直近 7 日 GPT-4 のみ」 view を 作って 後で呼ぶ。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2546,7 +2575,7 @@ export const tools: Tool[] = [
             endDate: { type: "string", description: "ISO timestamp (= 範囲終了)" },
             provider: {
               type: "string",
-              description: "プロバイダー (= 'openai' / 'anthropic' / 'google' 等)、 空 = 全 provider",
+              description: "プロバイダー (= 'openai' / 'anthropic' / 'gemini' / 'mistral')、 空 = 全 provider",
             },
             model: {
               type: "string",
@@ -2593,9 +2622,9 @@ export const tools: Tool[] = [
   {
     name: "export_calls",
     description:
-      "calls の large batch export (= POST /v1/query/export)。 query_calls より 高 limit (= plan 別 max records: Free 1000 / Pro 50000、 config/plans.ts)、 全 plan で利用可。 " +
-      "filter 軸 = startTime / endTime / provider / model + limit。 AI agent が 「先月分の全 GPT-4 呼び出しを取り出して傾向分析して」 narrative で 1 call carry。 " +
-      "結果 format は query_calls と 同 JSON (= AI が そのまま CSV / 統計に carry 可能)。",
+      "calls の large batch export (= POST /v1/query/export)。 query_calls より 高 limit (= plan 別 max records: Free 1000 / Pro 50000)、 全 plan で利用可。 " +
+      "filter 軸 = startTime / endTime / provider / model + limit。 AI agent が 「先月分の全 GPT-4 呼び出しを取り出して傾向分析して」 を 1 call で完結できる。 " +
+      "結果 format は query_calls と 同 JSON (= そのまま CSV / 統計処理に流し込める)。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2610,11 +2639,11 @@ export const tools: Tool[] = [
         },
         provider: {
           type: "string",
-          description: "プロバイダー fix (= openai / anthropic / google / azure / cohere)",
+          description: "プロバイダー filter (= openai / anthropic / gemini / mistral)",
         },
         model: {
           type: "string",
-          description: "model 名 fix (= 部分一致なし、 完全一致 例: 'gpt-4o-mini')",
+          description: "model 名 filter (= 部分一致なし、 完全一致。 例: 'gpt-4o-mini')",
         },
         limit: {
           type: "integer",
@@ -2629,9 +2658,9 @@ export const tools: Tool[] = [
     name: "bulk_delete_calls",
     description:
       "指定 call id 一覧 (= max 100) を 自 account 限定で 一括削除する (= POST /v1/calls/bulk-delete)。 " +
-      "AI agent が dogfood / dev test で 蓄積した garbage call の cleanup narrative に carry (= 軸 1 操作系)。 " +
+      "開発中の テストで 蓄積した 不要な call の cleanup に使える。 " +
       "dryRun=true で 削除前に matched 件数を 事前確認可能。 削除は 1 SQL atomic、 audit log に bulk_deleted event を 記録。 " +
-      "FK 制約上 関連 traces / annotations / scores は ON DELETE 経由で 連鎖削除 (= 既存 schema narrative)。",
+      "FK 制約上 関連 traces / annotations / scores は ON DELETE 経由で 連鎖削除される。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2662,7 +2691,7 @@ export const tools: Tool[] = [
     name: "compare_eval_runs",
     description:
       "2 つの eval run (baseline / candidate) を 比較して per-criterion mean score delta + failed count delta + verdict を 返す (= GET /v1/eval-runs/compare)。 " +
-      "AI agent は 「baseline と 比べて candidate は どう 変わったか」 を 1 call で 把握でき、 prompt 改善 効果や regress 検出 narrative に carry できる (= axis 1 操作系 + axis 4 自律 AI ops 寄与)。 " +
+      "AI agent は 「baseline と 比べて candidate は どう 変わったか」 を 1 call で 把握でき、 prompt 改善の 効果測定や regression 検出に使える。 " +
       "verdict = improved / regressed / mixed / unchanged。 failed count は score <= 2 を 「failed」 で 算出。 同 account 限定。",
     inputSchema: {
       type: "object",
@@ -2689,7 +2718,7 @@ export const tools: Tool[] = [
       "Pro+ 限定 (= Free は 403)、 OPENAI_API_KEY 未 provision 環境では backend で 500。 " +
       "前提: 採点は平文保管 (content-storage opt-in) が ON の call のみが対象。 opt-in OFF (= 既定) だと候補が 0 件になり、 " +
       "summary.scoredCount=0 + reason='no_plaintext_calls' を返す (= 故障ではなく gating)。 " +
-      "cost: 1 run あたり 約 $0.01 (= 20 calls × 5 criteria = 100 LLM call)、 founder dogfood 規模で月 30 run = $0.30 想定。",
+      "cost: 1 run あたり 約 $0.01 (= 20 calls × 5 criteria = 100 LLM call)、 月 30 run なら $0.30 程度。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2858,12 +2887,13 @@ export const tools: Tool[] = [
 ];
 
 /**
- * core プロファイル(2026-07-02)= 日常運用の要点だけに絞った 11 ツール。
- * 87 ツール全載せは agent クライアントのコンテキストを圧迫し tool 選択も迷いやすい
- * (ペルソナ監査で複数指摘)ため、環境変数 ARGOSVIX_MCP_PROFILE=core で最小集合に
- * 切り替えられる。既定は full(後方互換 = 挙動不変)。選定基準 = 記録を見る(query/
- * aggregate/コスト/レイテンシ)+ 健康診断 + 異常検知 + アラートの基本操作 +
- * 本番プロンプト解決。
+ * The core profile: 11 tools narrowed to the essentials of day-to-day
+ * operation. Exposing all 87 tools pressures the agent client's context and
+ * makes tool selection error-prone, so the ARGOSVIX_MCP_PROFILE=core env var
+ * switches to a minimal set. The default is full (backward compatible =
+ * behavior unchanged). Selection criteria: reading records (query / aggregate
+ * / cost / latency) + health check + anomaly detection + basic alert
+ * operations + production prompt resolution.
  */
 export const CORE_TOOL_NAMES: ReadonlySet<string> = new Set([
   "aggregate_calls",
@@ -2881,7 +2911,7 @@ export const CORE_TOOL_NAMES: ReadonlySet<string> = new Set([
 
 export type ToolProfile = "core" | "full";
 
-/** ARGOSVIX_MCP_PROFILE の解釈。未知値は full に倒して一度だけ warn。 */
+/** Interprets ARGOSVIX_MCP_PROFILE. Unknown values fall back to full with a single warning. */
 export function resolveToolProfile(raw: string | undefined): ToolProfile {
   if (raw === undefined || raw === "" || raw === "full") return "full";
   if (raw === "core") return "core";
@@ -2913,18 +2943,20 @@ export async function dispatchTool(input: DispatchInput): Promise<{
     if (!allowed) {
       return errorResponse(`unknown tool: ${name}`);
     }
-    // allowlist 外の key を 落とす (= LLM が schema 外 arg を渡しても URL に
-    // 乗らない、 account_id 等の injection を 構造防御)
+    // Drop keys outside the allowlist (even if the LLM passes args outside
+    // the schema, they never reach the URL — structural defense against
+    // injecting account_id etc.).
     const safeArgs: Record<string, unknown> = {};
     for (const key of allowed) {
       if (key in args) safeArgs[key] = args[key];
     }
     switch (name) {
       case "query_calls": {
-        // 0.3.1-alpha.1 fix: backend `/v1/query/calls` は POST 専用 + ISO startTime/
-        // endTime を 受け取る body 仕様。 以前は GET + query string で叩いており 実
-        // backend では 405 を返していた (= 0.2.0-alpha.1 / 0.3.0-alpha.1 で外部 user
-        // 影響あり)。 rangePreset を ISO range に翻訳して body にする。
+        // The backend `/v1/query/calls` is POST-only and takes ISO startTime/
+        // endTime in the body. An earlier implementation hit it with GET +
+        // query string, and the real backend returned 405 (affecting external
+        // users on 0.2.0-alpha.1 / 0.3.0-alpha.1). rangePreset is translated
+        // into an ISO range and put in the body.
         const body: Record<string, unknown> = {};
         const range = presetToTimeRange(safeArgs["rangePreset"]);
         body["startTime"] = range.startTime;
@@ -2938,22 +2970,35 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         if (typeof safeArgs["limit"] === "number") {
           body["limit"] = safeArgs["limit"];
         }
-        // 2026-06-11 外れ値 drill = latency 範囲 (ms)。 validation は backend 共有
-        // (= 非負有限数 + min <= max、 違反は 400 narrative がそのまま返る)。
+        // Outlier drill-down: latency range (ms). Validation is shared with
+        // the backend (non-negative finite numbers, min <= max; violations
+        // return the backend's 400 message as-is).
         if (typeof safeArgs["latencyMin"] === "number") {
           body["latencyMin"] = safeArgs["latencyMin"];
         }
         if (typeof safeArgs["latencyMax"] === "number") {
           body["latencyMax"] = safeArgs["latencyMax"];
         }
-        // 2026-06-12 keyset pagination cursor (= /calls「さらに読み込む」と同じ
-        // backend cursor を agent にも開放)。 片側のみ / 不正形式 / timestamp 降順
-        // 以外との併用は backend が 400 narrative を返す。
+        // Keyset pagination cursor (opens the same backend cursor that the
+        // /calls "load more" uses to agents as well). One-sided cursors,
+        // malformed values, or combining with anything other than descending
+        // timestamp order get a 400 message from the backend.
         if (typeof safeArgs["beforeTimestamp"] === "string") {
           body["beforeTimestamp"] = safeArgs["beforeTimestamp"];
         }
         if (typeof safeArgs["beforeId"] === "string") {
           body["beforeId"] = safeArgs["beforeId"];
+        }
+        // Tag filter exposure (the backend /v1/query/calls already supported
+        // the tagKey + tagValue pair, but the MCP side had not wired the
+        // schema / allowlist and silently dropped them). Validation is shared
+        // with the backend (TAG_KEY_PATTERN + 256-char cap; one-sided or
+        // malformed values return the backend's 400 message as-is).
+        if (typeof safeArgs["tagKey"] === "string") {
+          body["tagKey"] = safeArgs["tagKey"];
+        }
+        if (typeof safeArgs["tagValue"] === "string") {
+          body["tagValue"] = safeArgs["tagValue"];
         }
         return await callApi(apiBase, "/v1/query/calls", {}, apiKey, {
           method: "POST",
@@ -2961,13 +3006,15 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         });
       }
       case "get_cost_summary": {
-        // 0.3.1-alpha.1 fix: 同上 (= POST + ISO range body)。
-        // backend groupBy は "provider" | "model" | "day" | "tag" のみ受理するため、
-        // MCP schema の "none" は backend default の "provider" に正規化する (= LLM
-        // 後方互換、 「全体 sum」 意図なら provider 別 breakdown も同様の 全体 total を
-        // response.total で受け取れる)。 Codex round 1 MEDIUM 1 fix: schema 外の値
-        // (= "day" 等 backend 内部 enum) は強制的に provider に丸めず errorResponse で
-        // 早期 reject (= LLM の入力 typo を silent に隠さない)。
+        // Same as query_calls (POST + ISO range body). The backend groupBy
+        // accepts only "provider" | "model" | "day" | "tag", so the MCP
+        // schema's "none" is normalized to the backend default "provider"
+        // (LLM backward compatibility; if the intent was an overall sum, the
+        // per-provider breakdown provides the same overall total in
+        // response.total). Values outside the schema (backend-internal enums
+        // like "day", or typos) are not silently coerced to provider — they
+        // are rejected early via errorResponse (never hiding an LLM input
+        // typo).
         const body: Record<string, unknown> = { metric: "cost" };
         const range = presetToTimeRange(safeArgs["rangePreset"]);
         body["startTime"] = range.startTime;
@@ -3051,14 +3098,15 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         );
       }
       case "create_alert": {
-        // safeArgs は既に allowlist 済 (= account_id 等は混入しない)。 値の妥当性
-        // (= alertType enum / 閾値範囲 / channelKinds と channelTargets の整合 /
-        // plan 上限) は backend validateCreate + plan gate が最終判定し、 NG は
-        // 4xx で返る (= 二重防御)。
-        // 2026-06-06 narrative gap fix carry: MCP client の中には JSON Schema の
-        // `default` を 自動適用しないものがあり、 windowMinutes / sleepMinutes /
-        // enabled を 省略した呼び出しが backend に undefined で 届いて 400 化していた。
-        // dispatch 側で 明示的に default を carry する。
+        // safeArgs is already allowlisted (account_id etc. cannot slip in).
+        // Value validity (alertType enum / threshold ranges / channelKinds vs
+        // channelTargets consistency / plan limits) gets its final verdict
+        // from the backend's validateCreate + plan gate, returning 4xx on
+        // failure (double defense).
+        // Some MCP clients do not auto-apply JSON Schema `default`s, so calls
+        // omitting windowMinutes / sleepMinutes / enabled used to reach the
+        // backend as undefined and turn into 400s. The dispatch side applies
+        // the defaults explicitly.
         const body: Record<string, unknown> = { ...safeArgs };
         if (body["windowMinutes"] === undefined) body["windowMinutes"] = 60;
         if (body["sleepMinutes"] === undefined) body["sleepMinutes"] = 60;
@@ -3069,12 +3117,13 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         });
       }
       case "update_alert": {
-        // 2026-06-03 v1.6 #13-4 = PATCH /v1/alerts/:id 経由で 既存 alert を partial update。
-        // alertId は path 直前置換、 body は残りの allowlist 済 field (= name /
+        // Partial update of an existing alert via PATCH /v1/alerts/:id.
+        // alertId is substituted into the path just before the request; the
+        // body is the remaining allowlisted fields (name /
         // thresholdValue / windowMinutes / filterProvider / filterModel /
-        // channelKinds / channelTargets / sleepMinutes / enabled / conditions)。
-        // alertType は schema にも入れていない (= immutable)。 backend validateUpdate が
-        // 二重防御で最終 validation。
+        // channelKinds / channelTargets / sleepMinutes / enabled / conditions).
+        // alertType is not in the schema at all (immutable). The backend's
+        // validateUpdate provides the final validation as double defense.
         const alertId = validateAlertId(safeArgs["alertId"]);
         if (!alertId) {
           return errorResponse("alertId required (pattern: [A-Za-z0-9-]{1,64})");
@@ -3089,8 +3138,9 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         );
       }
       case "delete_alert": {
-        // 2026-06-03 v1.6 #13-4 = DELETE /v1/alerts/:id。 関連 alert_events も backend
-        // 側で CASCADE 削除される。 body なし、 alertId のみ path 直前置換。
+        // DELETE /v1/alerts/:id. Related alert_events are CASCADE-deleted on
+        // the backend. No body; only alertId is substituted into the path
+        // just before the request.
         const alertId = validateAlertId(safeArgs["alertId"]);
         if (!alertId) {
           return errorResponse("alertId required (pattern: [A-Za-z0-9-]{1,64})");
@@ -3116,9 +3166,11 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         );
       }
       case "list_alert_events": {
-        // limit / alertId / cursor は query param で /v1/alerts/events へ。 alertId は
-        // backend 側でも [A-Za-z0-9_-]+ で再 validate されるが、 schema pattern で先弾き済。
-        // cursor 2 つの同時指定契約は backend が 400 で enforce (= R77 と同型)。
+        // limit / alertId / cursor go to /v1/alerts/events as query params.
+        // alertId is re-validated on the backend with [A-Za-z0-9_-]+, but the
+        // schema pattern already rejects it up front. The contract that both
+        // cursors must be supplied together is enforced by the backend with a
+        // 400 (same pattern as query_calls).
         const beforeTs = safeArgs["beforeTriggeredAt"];
         if (beforeTs !== undefined && (typeof beforeTs !== "string" || Number.isNaN(Date.parse(beforeTs)))) {
           return errorResponse("beforeTriggeredAt must be ISO-8601 string");
@@ -3126,11 +3178,12 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         return await callApi(apiBase, "/v1/alerts/events", safeArgs, apiKey);
       }
       case "acknowledge_alert": {
-        // 2026-05-31 Phase 3 = 個別 event を ack。 eventId 経由 path 直前置換 (= /v1/
-        // alerts/events/:eventId/acknowledge POST)。 body の source は LLM から override
-        // させず、 MCP server 側で 強制的に "mcp" を carry (= audit trail で 発信源を
-        // 一意に識別、 attacker が source spoof で dashboard log を 偽装する path を
-        // 構造防御)。
+        // Ack an individual event. eventId is substituted into the path just
+        // before the request (POST /v1/alerts/events/:eventId/acknowledge).
+        // The body's source cannot be overridden by the LLM — the MCP server
+        // forces it to "mcp" (uniquely identifying the origin in the audit
+        // trail, structurally defending the path where an attacker spoofs the
+        // source to forge dashboard logs).
         const eventId = validateEventId(safeArgs["eventId"]);
         if (!eventId) {
           return errorResponse(
@@ -3179,9 +3232,10 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         );
       }
       case "create_annotation": {
-        // 2026-06-03 v1.6 #13-3 = POST /v1/annotations。 callId は body 必須、
-        // annotationText / label / qualityScore のうち少なくとも 1 つは backend で
-        // validate される (= 「空 annotation」 を 400)。 safeArgs は allowlist 済。
+        // POST /v1/annotations. callId is required in the body; the backend
+        // validates that at least one of annotationText / label / qualityScore
+        // is present (an "empty annotation" gets a 400). safeArgs is already
+        // allowlisted.
         const callId = validateCallId(safeArgs["callId"]);
         if (!callId) {
           return errorResponse("callId required (pattern: [A-Za-z0-9_-]{1,128})");
@@ -3192,9 +3246,10 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         });
       }
       case "update_annotation": {
-        // 2026-06-03 v1.6 #13-3 = PATCH /v1/annotations/:id with allowlisted body。
-        // annotationId は path 直前置換、 body は残りの 3 field (= annotationText /
-        // label / qualityScore)。 callId は immutable (= schema 不在で 二重防御)。
+        // PATCH /v1/annotations/:id with allowlisted body. annotationId is
+        // substituted into the path just before the request; the body is the
+        // remaining 3 fields (annotationText / label / qualityScore). callId
+        // is immutable (absent from the schema as double defense).
         const annotationId = validateAnnotationId(safeArgs["annotationId"]);
         if (!annotationId) {
           return errorResponse("annotationId required (positive integer up to 10 digits)");
@@ -3209,7 +3264,7 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         );
       }
       case "delete_annotation": {
-        // 2026-06-03 v1.6 #13-3 = DELETE /v1/annotations/:id。 body なし。
+        // DELETE /v1/annotations/:id. No body.
         const annotationId = validateAnnotationId(safeArgs["annotationId"]);
         if (!annotationId) {
           return errorResponse("annotationId required (positive integer up to 10 digits)");
@@ -3421,8 +3476,9 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         if (typeof safeArgs["monthlyLimitUsd"] !== "number") {
           return errorResponse("monthlyLimitUsd required (number, 0.01-1000000)");
         }
-        // safeArgs 丸投げでなく明示 field 構築 (= 将来 allowlist 拡張で意図しない
-        // field が素通りしない防御、 R65a MEDIUM 3)
+        // Build the fields explicitly instead of passing safeArgs wholesale
+        // (prevents unintended fields from passing through when the allowlist
+        // is extended in the future).
         const body: Record<string, unknown> = {
           monthlyLimitUsd: safeArgs["monthlyLimitUsd"],
         };
@@ -3432,12 +3488,14 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         if (typeof safeArgs["enabled"] === "boolean") {
           body["enabled"] = safeArgs["enabled"];
         }
-        // 監査 Tier 2 = per-project gate。 指定時のみ送る(所有検証は backend)。
+        // Per-project gate. Sent only when specified (ownership verification
+        // happens on the backend).
         if (typeof safeArgs["projectId"] === "string") {
           body["projectId"] = safeArgs["projectId"];
         }
-        // 監査 Tier 2 = per-tag gate。 tagKey/tagValue は both-or-neither / projectId 排他を
-        // backend(parseGateBody)が enforce。 ここでは指定時のみ素通しする。
+        // Per-tag gate. The backend (parseGateBody) enforces both-or-neither
+        // for tagKey/tagValue and mutual exclusion with projectId. Here they
+        // are passed through only when specified.
         if (typeof safeArgs["tagKey"] === "string") {
           body["tagKey"] = safeArgs["tagKey"];
         }
@@ -3541,8 +3599,9 @@ export async function dispatchTool(input: DispatchInput): Promise<{
       }
       case "create_policy_gate": {
         const body: Record<string, unknown> = {};
-        // 型不一致は黙って drop せず即 reject (= R66a MEDIUM 3、 agent が
-        // 「設定した」と誤認する部分更新を防ぐ)
+        // Type mismatches are rejected immediately, not silently dropped
+        // (prevents a partial update where the agent falsely believes the
+        // setting was applied).
         if ("modelAllowlist" in safeArgs) {
           if (!Array.isArray(safeArgs["modelAllowlist"])) {
             return errorResponse("modelAllowlist must be an array of model names");
@@ -3807,11 +3866,12 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         return await callApi(apiBase, "/v1/projects", {}, apiKey);
       }
       case "list_members": {
-        // R72c MEDIUM 2 fix: backend の full shape (= userId / accountId /
-        // invitedBy / suspendedAt / removedAt / updatedAt 等の内部 ID・管理 field)
-        // を MCP に素通ししない。 description どおり email / role / status /
-        // 参加日時の最小 projection に絞る (= dashboard team UI は full shape を
-        // 使うため backend response 自体は変えない)。
+        // Never pass the backend's full shape (internal IDs and admin fields
+        // like userId / accountId / invitedBy / suspendedAt / removedAt /
+        // updatedAt) through to MCP. As the description states, narrow to the
+        // minimal projection of email / role / status / join date (the
+        // dashboard team UI uses the full shape, so the backend response
+        // itself is unchanged).
         const res = await callApi(apiBase, "/v1/memberships", {}, apiKey);
         if (res.isError) return res;
         try {
@@ -3886,8 +3946,8 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         const max = safeArgs["maxRecords"];
         const body: Record<string, unknown> = {};
         if (max !== undefined) {
-          // 2026-06-05 R20 #3 fix = Number.isInteger で 1.9 等 を 弾く、
-          // backend と 同 contract。 Math.floor の 暗黙丸めを廃止。
+          // Number.isInteger rejects values like 1.9 — same contract as the
+          // backend. The implicit Math.floor rounding was removed.
           if (typeof max !== "number" || !Number.isInteger(max) || max < 1 || max > 100) {
             return errorResponse("maxRecords must be integer 1-100");
           }
@@ -3902,10 +3962,11 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         );
       }
       case "propose_eval_criteria": {
-        // 2026-06-05 axis 4 Tier 1 closing = LLM-judge で eval criterion 候補生成。
-        // useCaseHint 必須、 sampleCallIds + maxCriteria は任意。 backend で plan +
-        // budget + decrypt + LLM call を carry、 MCP は client-side validation +
-        // forward のみ。 hallucination 影響は構造的に限定 (= 「propose」 軸)。
+        // Generates eval criterion candidates via LLM judge. useCaseHint is
+        // required; sampleCallIds + maxCriteria are optional. The backend
+        // handles plan + budget + decrypt + the LLM call; MCP does only
+        // client-side validation + forwarding. Hallucination impact is
+        // structurally limited (it only "proposes").
         const useCaseHintRaw = safeArgs["useCaseHint"];
         if (typeof useCaseHintRaw !== "string" || useCaseHintRaw.length < 1 || useCaseHintRaw.length > 500) {
           return errorResponse("useCaseHint required (string 1-500 chars)");
@@ -3948,11 +4009,11 @@ export async function dispatchTool(input: DispatchInput): Promise<{
           { method: "POST", jsonBody: body },
         );
       }
-      // 2026-06-06 axis 4 Tier 2 = 自律 AI ops 第一弾 (= purge_expired_plaintext + retry_failed_webhook)。
-      // 両 tool 共通 narrative:
-      //   - dryRun=true / false の 2 path (= mutation 前の preview narrative)
-      //   - backend で audit emit + UPDATE 順序 carry (= R35 narrative)
-      //   - founder dogfood scope (= 当面 approval gating UI なし、 利用規約 v2.x 改訂は v1.8 carry)
+      // Autonomous AI ops tools (purge_expired_plaintext + retry_failed_webhook).
+      // Shared behavior of both tools:
+      //   - two paths, dryRun=true / false (preview before mutation)
+      //   - the backend handles audit emission + UPDATE ordering
+      //   - operator-scoped for now (no approval-gating UI yet)
       case "purge_expired_plaintext": {
         const olderThanDaysRaw = safeArgs["olderThanDays"];
         const body: Record<string, unknown> = {};
@@ -4127,9 +4188,9 @@ export async function dispatchTool(input: DispatchInput): Promise<{
           { method: "POST", jsonBody: body },
         );
       }
-      // 2026-06-07 axis 4 Tier 2 第三弾 = extend_customer_trial + apply_promo_code_to_customer。
-      // founder dogfood scope + Stripe API mutation 軸、 dryRun 必須、 backend で Stripe
-      // Idempotency-Key carry。
+      // extend_customer_trial + apply_promo_code_to_customer: operator-scoped
+      // Stripe API mutations. dryRun is required; the backend handles the
+      // Stripe Idempotency-Key.
       case "extend_customer_trial": {
         const targetAccountIdRaw = safeArgs["targetAccountId"];
         if (
@@ -4156,10 +4217,10 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         ) {
           return errorResponse("reason must be non-empty string <= 200 chars");
         }
-        // R39 HIGH 1 carry: dryRun を MCP layer でも 必須明示 化。
+        // dryRun must be explicit at the MCP layer too.
         const dryRunRaw = safeArgs["dryRun"];
         if (typeof dryRunRaw !== "boolean") {
-          return errorResponse("dryRun must be explicit boolean (= R39 safety carry)");
+          return errorResponse("dryRun must be an explicit boolean");
         }
         const body: Record<string, unknown> = {
           targetAccountId: targetAccountIdRaw,
@@ -4167,7 +4228,7 @@ export async function dispatchTool(input: DispatchInput): Promise<{
           reason: reasonRaw,
           dryRun: dryRunRaw,
         };
-        // R39 SB2 carry: dryRun=false 時 idempotencyKey 必須。
+        // With dryRun=false, idempotencyKey is required.
         if (dryRunRaw === false) {
           const ikRaw = safeArgs["idempotencyKey"];
           if (
@@ -4230,7 +4291,7 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         }
         const dryRunRaw = safeArgs["dryRun"];
         if (typeof dryRunRaw !== "boolean") {
-          return errorResponse("dryRun must be explicit boolean (= R39 safety carry)");
+          return errorResponse("dryRun must be an explicit boolean");
         }
         const body: Record<string, unknown> = {
           targetAccountId: targetAccountIdRaw,
@@ -4271,10 +4332,12 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         );
       }
       case "detect_anomaly": {
-        // 2026-06-05 axis 4 Tier 1 = 現 window vs baseline window (= 同 length
-        // の 1 期前) 比較で 4 軸 異常検出。 pure MCP-side aggregator、 backend
-        // 変更ゼロ。 threshold 感度 = 1.5× (sensitive) / 2× (normal) / 3×
-        // (conservative)。 baseline data 不足は anomalies: [] + warning。
+        // Anomaly detection on 4 dimensions by comparing the current window
+        // against a baseline window (the immediately preceding period of the
+        // same length). A pure MCP-side aggregator; zero backend changes.
+        // Threshold sensitivity: 1.5x (sensitive) / 2x (normal) / 3x
+        // (conservative). Insufficient baseline data yields anomalies: [] +
+        // a warning.
         const winRaw = typeof safeArgs["window"] === "string" ? safeArgs["window"] : "24h";
         const window =
           winRaw === "1h" || winRaw === "24h" || winRaw === "7d" ? winRaw : "24h";
@@ -4366,10 +4429,10 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         ]);
         const current = currentResult.window;
         const baseline = baselineResult.window;
-        // Codex R19 🟡 #3 fix = propose_alert_rules / detect_anomaly でも
-        // partialFailures を carry (= get_account_health 同形式)。 endpoint
-        // 落ちた軸を 透明性 narrative で 返す = AI agent が 「低 traffic
-        // narrative」 と 「endpoint fail narrative」 を区別できる。
+        // propose_alert_rules / detect_anomaly also report partialFailures
+        // (same format as get_account_health). Returning which dimensions'
+        // endpoints failed, for transparency, lets an AI agent distinguish
+        // "low traffic" from "endpoint failure".
         const partialFailures = [
           ...currentResult.failures.map((f) => `current:${f}`),
           ...baselineResult.failures.map((f) => `baseline:${f}`),
@@ -4433,14 +4496,14 @@ export async function dispatchTool(input: DispatchInput): Promise<{
             current: Math.round(current.p95Latency),
             baseline: Math.round(baseline.p95Latency),
             ratio: Math.round(ratio * 100) / 100,
-            narrative: `p95 latency が baseline の ${ratio.toFixed(1)}× (${Math.round(current.p95Latency)} ms vs ${Math.round(baseline.p95Latency)} ms)。 LLM provider 側 劣化 / 自社 prompt 改変 / network 等 軸。`,
+            narrative: `p95 latency が baseline の ${ratio.toFixed(1)}× (${Math.round(current.p95Latency)} ms vs ${Math.round(baseline.p95Latency)} ms)。 LLM provider 側の劣化 / 自社 prompt 改変 / network などが原因候補。`,
           });
         }
         // 3. error_rate spike (= current > max(baseline × multiplier, +5pp))
-        // 注: backend aggregate_calls の error_rate metric は percent (0-100) で
-        // 返る (= query.ts valueExpr "(...) * 100")。 ここの単位は 全 て percent
-        // で carry、 narrative も percent で表示。 +5pp は 5.0 (= 5 percentage
-        // points) で 加算。
+        // Note: the backend aggregate_calls error_rate metric is returned as
+        // a percent (0-100) (query.ts valueExpr "(...) * 100"). All units
+        // here are percent, and the narrative displays percent too. +5pp is
+        // added as 5.0 (5 percentage points).
         if (
           baseline.errorRate !== null &&
           current.errorRate !== null &&
@@ -4459,10 +4522,10 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         // 4. call volume spike or drop (= current calls > baseline × multiplier OR < baseline / multiplier)
         if (baseline.calls > 0) {
           const ratio = current.calls / baseline.calls;
-          // Codex R19 🟡 #4 fix = cost / latency / error_rate と 同 軸で
-          // strict `>` 比較 (= 例 multiplier=2 で 2.0× 丁度は anomaly に
-          // しない、 2.01× で carry)。 旧 `>= multiplier` だと boundary
-          // semantics が tool 軸 で 食い違っていた。
+          // Strict `>` comparison, same as the cost / latency / error_rate
+          // dimensions (e.g. with multiplier=2, exactly 2.0x is not an
+          // anomaly; 2.01x is). The old `>= multiplier` made the boundary
+          // semantics inconsistent across the tool's dimensions.
           if (ratio > multiplier) {
             anomalies.push({
               axis: "call_volume",
@@ -4470,7 +4533,7 @@ export async function dispatchTool(input: DispatchInput): Promise<{
               current: current.calls,
               baseline: baseline.calls,
               ratio: Math.round(ratio * 100) / 100,
-              narrative: `call volume が baseline の ${ratio.toFixed(1)}× (${current.calls} vs ${baseline.calls})。 traffic spike / retry storm / new user onboarding 等 軸。`,
+              narrative: `call volume が baseline の ${ratio.toFixed(1)}× (${current.calls} vs ${baseline.calls})。 traffic spike / retry storm / new user onboarding などが原因候補。`,
             });
           } else if (ratio > 0 && 1 / ratio > multiplier) {
             const dropRatio = 1 / ratio;
@@ -4480,7 +4543,7 @@ export async function dispatchTool(input: DispatchInput): Promise<{
               current: current.calls,
               baseline: baseline.calls,
               ratio: Math.round(ratio * 100) / 100,
-              narrative: `call volume が baseline の 1/${dropRatio.toFixed(1)} に 急減 (${current.calls} vs ${baseline.calls})。 SDK side outage / user drop-off / 自社 feature flag 等 軸。`,
+              narrative: `call volume が baseline の 1/${dropRatio.toFixed(1)} に 急減 (${current.calls} vs ${baseline.calls})。 SDK 側の outage / user drop-off / 自社 feature flag などが原因候補。`,
             });
           }
         }
@@ -4502,9 +4565,10 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         };
       }
       case "propose_alert_rules": {
-        // 2026-06-05 axis 4 Tier 1 = baseline 統計 + 推奨 alert rule 提案。
-        // propose のみ、 適用は別 step (= create_alert)。 既存 alert と被る
-        // type は skipped 配列に reason 付きで carry (= duplicate 防御)。
+        // Baseline statistics + recommended alert rule proposals. Proposal
+        // only; applying is a separate step (create_alert). Types that would
+        // duplicate an existing alert go into the skipped array with a reason
+        // (duplicate defense).
         const lookbackRaw = safeArgs["lookbackDays"];
         const lookbackDays =
           typeof lookbackRaw === "number" &&
@@ -4590,10 +4654,11 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         const alerts = extractJson(alertsRes) as {
           alerts?: Array<{ alertType?: string; name?: string }>;
         } | null;
-        // Codex R19 🟡 #3 fix = propose_alert_rules も partialFailures を carry
-        // (= get_account_health 同形式)。 endpoint 落ちた軸を 透明性 narrative
-        // で 返す = AI agent が 「baseline 統計が 正確」 と 「endpoint fail 由来
-        // baseline=0」 を 区別できる。
+        // propose_alert_rules also reports partialFailures (same format as
+        // get_account_health). Returning which dimensions' endpoints failed,
+        // for transparency, lets an AI agent distinguish "the baseline
+        // statistics are accurate" from "baseline=0 caused by an endpoint
+        // failure".
         const partialFailures: string[] = [];
         if (dailyCost === null) partialFailures.push("dailyCost");
         if (errorRate === null) partialFailures.push("errorRate");
@@ -4639,8 +4704,10 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         }> = [];
         const skipped: Array<{ alertType: string; reason: string }> = [];
 
-        // 1. cost_threshold = 過去 lookback 平均の 2× で trigger (= 異常な 1 日 支出 を 検出)
-        //    create_alert enum と整合する type 名 (= cost_threshold) で 提案、 1 日窓 (windowMinutes 1440)
+        // 1. cost_threshold: triggers at 2x the lookback average (detects an
+        //    abnormal single day of spend). Proposed under the type name
+        //    consistent with the create_alert enum (cost_threshold), with a
+        //    1-day window (windowMinutes 1440).
         if (existingTypes.has("cost_threshold")) {
           skipped.push({
             alertType: "cost_threshold",
@@ -4662,8 +4729,9 @@ export async function dispatchTool(input: DispatchInput): Promise<{
           });
         }
 
-        // 2. latency_degradation = 過去 p95 の 1.5× で trigger
-        //    create_alert enum と整合する type 名 (= latency_degradation) で 提案
+        // 2. latency_degradation: triggers at 1.5x the historical p95.
+        //    Proposed under the type name consistent with the create_alert
+        //    enum (latency_degradation).
         if (existingTypes.has("latency_degradation")) {
           skipped.push({
             alertType: "latency_degradation",
@@ -4685,7 +4753,7 @@ export async function dispatchTool(input: DispatchInput): Promise<{
           });
         }
 
-        // 3. error_rate = 観測 error_rate の 3× もしくは最低 5% で trigger
+        // 3. error_rate: triggers at 3x the observed error_rate, or at least 5%.
         if (existingTypes.has("error_rate")) {
           skipped.push({
             alertType: "error_rate",
@@ -4697,10 +4765,11 @@ export async function dispatchTool(input: DispatchInput): Promise<{
             reason: `lookback の total calls = ${totalCalls} で 統計的に baseline 不確定 (要 100+ calls)`,
           });
         } else {
-          // 注: backend は error_rate を percent (0-100) で carry。
-          // observedErrorRate は aggregate_calls 由来 = percent。 threshold
-          // も percent で 提案、 create_alert backend も percent を 期待
-          // (= line 331 「error_rate は %」 narrative 整合)。
+          // Note: the backend expresses error_rate as a percent (0-100).
+          // observedErrorRate comes from aggregate_calls, so it is a percent
+          // too. The threshold is also proposed in percent, and the
+          // create_alert backend expects percent as well (consistent with
+          // the "error_rate is %" note in the schema).
           const baseRate = observedErrorRate ?? 0;
           const threshold = Math.max(5, Math.round(baseRate * 3 * 10) / 10);
           proposals.push({
@@ -4712,7 +4781,8 @@ export async function dispatchTool(input: DispatchInput): Promise<{
           });
         }
 
-        // 4. anomaly_cost = 統計的異常検知 (= forecast モデル baseline、 type 別 1 件のみ)
+        // 4. anomaly_cost: statistical anomaly detection (forecast-model
+        //    baseline; at most one proposal per type).
         if (existingTypes.has("anomaly_cost")) {
           skipped.push({
             alertType: "anomaly_cost",
@@ -4756,9 +4826,10 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         };
       }
       case "get_account_health": {
-        // 2026-06-05 axis 4 Tier 1 = 自社 LLM infra 健康状態 サマリ。 既存
-        // 4 endpoint を 並列 fetch + 1 narrative 圧縮。 個別 fail は partial
-        // で carry (= 1 軸 timeout で summary を 止めない設計)。
+        // Health summary of the account's LLM infra. Fetches 4 existing
+        // endpoints in parallel and compresses them into one narrative.
+        // Individual failures are reported as partial (designed so one
+        // dimension timing out never blocks the summary).
         const winRaw = typeof safeArgs["window"] === "string" ? safeArgs["window"] : "24h";
         const window =
           winRaw === "1h" || winRaw === "24h" || winRaw === "7d" ? winRaw : "24h";
@@ -4828,8 +4899,13 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         const percentiles = extractJson(percentilesRes) as
           | { p50?: number | null; p95?: number | null; p99?: number | null; total?: number }
           | null;
+        // The actual response of backend GET /v1/account/llm-feature-budget is
+        // { budgetUsd, spentUsd, remainingUsd, periodStart, ... }
+        // (llmFeatureBudgetHandler.ts readBudget). The old parse read
+        // { monthlyLimitUsd, usedUsd }, which do not exist, so the budget
+        // warnings (90%/70%) could never fire.
         const budget = extractJson(budgetRes) as
-          | { monthlyLimitUsd?: number; usedUsd?: number; remainingUsd?: number }
+          | { budgetUsd?: number; spentUsd?: number; remainingUsd?: number }
           | null;
         const audit = extractJson(auditRes) as
           | { events?: unknown[] }
@@ -4843,16 +4919,16 @@ export async function dispatchTool(input: DispatchInput): Promise<{
         const p50 = percentiles?.p50 ?? null;
         const p95 = percentiles?.p95 ?? null;
         const p99 = percentiles?.p99 ?? null;
-        const budgetUsed = budget?.usedUsd ?? null;
-        const budgetLimit = budget?.monthlyLimitUsd ?? null;
+        const budgetUsed = budget?.spentUsd ?? null;
+        const budgetLimit = budget?.budgetUsd ?? null;
         const budgetPercent =
           budgetUsed !== null && budgetLimit !== null && budgetLimit > 0
             ? Math.round((budgetUsed / budgetLimit) * 1000) / 10
             : null;
         const recentEvents = Array.isArray(audit?.events) ? audit.events.length : 0;
-        // 注: backend aggregate_calls の error_rate metric は percent (0-100) で
-        // 返る (= query.ts valueExpr "(...) * 100")、 fraction (0-1) では ない。
-        // 閾値も percent で carry: critical = 10% / warn = 3%。
+        // Note: the backend aggregate_calls error_rate metric is returned as a
+        // percent (0-100) (query.ts valueExpr "(...) * 100"), not a fraction
+        // (0-1). The thresholds are in percent too: critical = 10% / warn = 3%.
         let summary: "ok" | "warn" | "critical" = "ok";
         if (
           (errorRate !== null && errorRate >= 10) ||
@@ -5069,16 +5145,18 @@ async function callApi(
   const res = await fetch(url.toString(), init);
 
   if (!res.ok) {
-    // Codex v0.4.0 HIGH 1 fix: backend error body の生 text を LLM に expose しない。
-    // 詳細 (= body / requestId) は stderr に log、 client には status + path のみ返す
-    // (= 内部実装 / PII / 内部識別子の漏洩を 構造防御)。
-    // v0.9.2 fix: raw body は ARGOSVIX_MCP_DEBUG=1 env で 明示 opt-in した時だけ log
-    // に carry (= production log aggregator に backend 由来の機微情報を 残さない default、
-    // operator が 必要時に env で 明示 enable)。 Codex v0.4.0 round 2 LOW 2 carry。
-    // 2026-06-06 narrative gap fix: backend が return する `error` / `reason` /
-    // `actionable` の 3 field は 設計上 user-facing (= PII を 含まない、 解決手順
-    // narrative)。 raw body 全部の surface は依然 close したまま、 これら 3 field
-    // のみ selectively extract して MCP user に carry する。
+    // Never expose the backend error body's raw text to the LLM. Details
+    // (body / requestId) go to the stderr log; the client gets only status +
+    // path (structural defense against leaking internal implementation / PII
+    // / internal identifiers).
+    // The raw body is logged only when explicitly opted in via
+    // ARGOSVIX_MCP_DEBUG=1 (the default leaves no backend-originated
+    // sensitive data in production log aggregators; operators enable it via
+    // the env var when needed).
+    // The 3 fields the backend returns — `error` / `reason` / `actionable` —
+    // are user-facing by design (no PII; remediation guidance). The full raw
+    // body remains closed off; only these 3 fields are selectively extracted
+    // and surfaced to the MCP user.
     const rawBody = await res.text().catch(() => "");
     const requestId = res.headers.get("x-request-id") ?? undefined;
     // eslint-disable-next-line no-console
@@ -5087,7 +5165,7 @@ async function callApi(
         (requestId ? ` requestId=${requestId}` : "") +
         (isDebugEnabled() && rawBody ? ` body=${rawBody.slice(0, 300)}` : ""),
     );
-    // Selective surface = user-facing narrative field のみ JSON parse して抽出。
+    // Selective surface: JSON-parse and extract only the user-facing fields.
     let userNarrative = "";
     if (rawBody) {
       try {
@@ -5104,7 +5182,8 @@ async function callApi(
           userNarrative = ` — ${parts.join(" / ")}`;
         }
       } catch {
-        // JSON parse 失敗 = 生 text を surface しない (= 既存 security narrative carry)
+        // On JSON parse failure, never surface the raw text (preserves the
+        // security posture above).
       }
     }
     return errorResponse(
@@ -5114,7 +5193,7 @@ async function callApi(
     );
   }
 
-  // 204 No Content (= silence DELETE 等) でも safely handle
+  // Handle 204 No Content safely too (e.g. the silence DELETE).
   if (res.status === 204) {
     return {
       content: [{ type: "text", text: JSON.stringify({ ok: true, status: 204 }, null, 2) }],
@@ -5131,7 +5210,7 @@ async function callApi(
   };
 }
 
-/** alertId は backend regex (= [A-Za-z0-9-]{1,64}) で validate、 path injection 防御。 */
+/** alertId is validated with the backend regex ([A-Za-z0-9-]{1,64}); path injection defense. */
 function validateAlertId(value: unknown): string | null {
   if (typeof value !== "string") return null;
   if (!/^[A-Za-z0-9-]{1,64}$/.test(value)) return null;
@@ -5145,8 +5224,8 @@ function validateProposalId(value: unknown): string | null {
 }
 
 /**
- * budget gate id = backend budgetGateHandler の `bg_` + UUID hex 32。
- * path injection 防御で形式を固定する。
+ * Budget gate id = `bg_` + 32 UUID hex chars, from the backend's
+ * budgetGateHandler. The format is pinned as path injection defense.
  */
 function validateBudgetGateId(value: unknown): string | null {
   if (typeof value !== "string") return null;
@@ -5154,14 +5233,14 @@ function validateBudgetGateId(value: unknown): string | null {
   return value;
 }
 
-/** approval id = backend approvalsHandler の `apr_` + UUID hex 32。 */
+/** Approval id = `apr_` + 32 UUID hex chars, from the backend's approvalsHandler. */
 function validateApprovalId(value: unknown): string | null {
   if (typeof value !== "string") return null;
   if (!/^apr_[a-f0-9]{32}$/.test(value)) return null;
   return value;
 }
 
-/** policy gate id = backend policyGateHandler の `pg_` + UUID hex 32。 */
+/** Policy gate id = `pg_` + 32 UUID hex chars, from the backend's policyGateHandler. */
 function validatePolicyGateId(value: unknown): string | null {
   if (typeof value !== "string") return null;
   if (!/^pg_[a-f0-9]{32}$/.test(value)) return null;
@@ -5169,9 +5248,10 @@ function validatePolicyGateId(value: unknown): string | null {
 }
 
 /**
- * eventId は backend regex (= [A-Za-z0-9_-]{1,64}、 alert_events.id) で validate、
- * path injection 防御。 alertId と異なり _ (underscore) も accept (= UUID v4 dashed
- * 形式 + 旧 cuid 形式 両方 carry)。
+ * eventId is validated with the backend regex ([A-Za-z0-9_-]{1,64},
+ * alert_events.id); path injection defense. Unlike alertId it also accepts _
+ * (underscore), supporting both the dashed UUID v4 format and the legacy cuid
+ * format.
  */
 function validateEventId(value: unknown): string | null {
   if (typeof value !== "string") return null;
@@ -5180,8 +5260,9 @@ function validateEventId(value: unknown): string | null {
 }
 
 /**
- * callId (= LLM call id) は backend regex (= [A-Za-z0-9_-]{1,128}) で validate、
- * path injection 防御。 query_calls.records[].id と同じ shape。
+ * callId (LLM call id) is validated with the backend regex
+ * ([A-Za-z0-9_-]{1,128}); path injection defense. Same shape as
+ * query_calls.records[].id.
  */
 function validateCallId(value: unknown): string | null {
   if (typeof value !== "string") return null;
@@ -5190,8 +5271,9 @@ function validateCallId(value: unknown): string | null {
 }
 
 /**
- * annotationId は AUTOINCREMENT integer (= 1-10 桁)。 path 直前置換用に digits 限定
- * regex で 再 validate (= LLM が float / string で渡しても 構造防御)。
+ * annotationId is an AUTOINCREMENT integer (1-10 digits). Re-validated with a
+ * digits-only regex for path substitution just before the request (structural
+ * defense even when the LLM passes a float / string).
  */
 function validateAnnotationId(value: unknown): string | null {
   if (typeof value === "number" && Number.isInteger(value) && value >= 1 && value < 1e10) {
@@ -5203,7 +5285,7 @@ function validateAnnotationId(value: unknown): string | null {
   return null;
 }
 
-/** outbound webhook id = "owh_" + 24 hex(backend extractId と一致)。 path 直前置換用。 */
+/** Outbound webhook id = "owh_" + 24 hex chars (matches the backend's extractId). For path substitution just before the request. */
 function validateWebhookId(value: unknown): string | null {
   if (typeof value === "string" && /^owh_[a-f0-9]{24}$/.test(value)) {
     return value;
@@ -5212,8 +5294,9 @@ function validateWebhookId(value: unknown): string | null {
 }
 
 /**
- * annotation label は backend regex (= [A-Za-z0-9_-]{1,64}) で validate、 query param
- * 直前置換用。 list_annotations_by_label の label arg を gate する。
+ * Annotation labels are validated with the backend regex
+ * ([A-Za-z0-9_-]{1,64}); for query-param substitution just before the
+ * request. Gates the label arg of list_annotations_by_label.
  */
 function validateAnnotationLabel(value: unknown): string | null {
   if (typeof value !== "string") return null;
@@ -5222,10 +5305,10 @@ function validateAnnotationLabel(value: unknown): string | null {
 }
 
 /**
- * 0.3.1-alpha.1 fix: rangePreset を ISO 8601 startTime/endTime に変換する。
- * backend `/v1/query/*` は POST body で startTime + endTime を要求するため、 LLM 友好な
- * preset (= "24h" / "7d" / "30d" / "90d") をここで wall-clock 値に解決する。
- * 未指定 / 不正値は "24h" を default に carry。
+ * Converts rangePreset into ISO 8601 startTime/endTime. The backend's
+ * `/v1/query/*` requires startTime + endTime in the POST body, so the
+ * LLM-friendly presets ("24h" / "7d" / "30d" / "90d") are resolved to
+ * wall-clock values here. Missing / invalid values default to "24h".
  */
 function presetToTimeRange(value: unknown): {
   startTime: string;

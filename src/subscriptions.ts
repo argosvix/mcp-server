@@ -1,32 +1,40 @@
 /**
- * MCP resources/subscribe 軽量 carry (= v0.10.0-alpha.1、 v0.8 backlog 倒し込み)。
+ * Lightweight MCP resources/subscribe support (added in v0.10.0-alpha.1).
  *
- * MCP spec の `resources.subscribe` capability を stdio transport で carry する。
- * client が `resources/subscribe` で URI を 登録すると、 polling cycle で 当該
- * resource の hash を 比較し、 変化を 検出した時に `notifications/resources/updated`
- * を send する。
+ * Implements the MCP spec's `resources.subscribe` capability on the stdio
+ * transport. When a client registers a URI via `resources/subscribe`, each
+ * polling cycle compares the resource's hash and sends
+ * `notifications/resources/updated` when a change is detected.
  *
- * 対応 URI (= 3 static resources のみ、 resource templates = calls/{id} 等は対象外):
+ * Supported URIs (the 3 static resources only; resource templates such as
+ * calls/{id} are out of scope):
  *   - argosvix://account
  *   - argosvix://alerts/active
  *   - argosvix://cost/today
  *
- * 設計選択:
- *   - polling = 60 秒 interval (= backend 負荷と更新遅延の妥協点)
- *   - HTTP transport では setupSubscribe を call しない (= per-request stateless で
- *     subscription state が 持てない、 capabilities でも subscribe 宣言なし)
- *   - shutdown / 接続切断時 = polling timer stop + subscription set 全削除
- *   - subscription set は 単一 server instance 単位 (= stdio = 1 client 1 process)
- *   - fetch 失敗 (= 401 / network) は silent skip (= 次回 cycle で 再試行)、 hash は
- *     前回値 keep (= 「fetch 不可 = 変化なし」 と扱い 不要 notify 抑制)
- *   - hash = JSON.stringify + djb2-like rolling 32bit (= 軽量、 暗号目的ではない)
+ * Design choices:
+ *   - Polling at a 60-second interval (a compromise between backend load and
+ *     update latency)
+ *   - The HTTP transport never calls setupSubscribe (per-request stateless, so
+ *     subscription state cannot be held; subscribe is not declared in its
+ *     capabilities either)
+ *   - On shutdown / disconnect: stop the polling timer and clear the whole
+ *     subscription set
+ *   - The subscription set is per server instance (stdio = 1 client, 1 process)
+ *   - Fetch failures (401 / network) are silently skipped (retried next cycle);
+ *     the hash keeps its previous value ("cannot fetch" is treated as "no
+ *     change" to suppress spurious notifications)
+ *   - Hash = JSON.stringify + a djb2-like rolling 32-bit hash (lightweight, not
+ *     cryptographic)
  *
- * Codex / 実装 backlog (= v0.10 では carry しない):
- *   - resource templates の per-id subscribe (= calls/{id} 等、 LLM が個別 call の
- *     更新を 監視する path)
- *   - listChanged notification (= resource list 自体は server lifecycle 内 固定で 不要)
- *   - WebSocket / SSE 経由の HTTP subscribe (= persistent connection 必要、 重い)
- *   - polling interval の env-driven 設定 (= MCP_SUBSCRIBE_POLL_MS で override 可能化)
+ * Deliberately not implemented here (backlog):
+ *   - Per-id subscribe for resource templates (calls/{id} etc., the path where
+ *     an LLM watches updates to an individual call)
+ *   - listChanged notification (the resource list itself is fixed for the
+ *     server lifecycle, so it is unnecessary)
+ *   - HTTP subscribe via WebSocket / SSE (requires persistent connections;
+ *     heavy)
+ *   - Env-driven polling interval (overridable via MCP_SUBSCRIBE_POLL_MS)
  */
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -51,13 +59,14 @@ interface SubscribeContext {
   server: Server;
   apiKey: string;
   apiBase: string;
-  /** test 用 override (= 60 秒は long すぎるため unit test では小さい値で carry)。 */
+  /** Test override (60 seconds is too long for unit tests, which use a small value). */
   pollIntervalMs?: number;
 }
 
 /**
- * 軽量 32bit hash (= djb2 風)。 暗号目的ではなく、 等価判定の高速軸として carry。
- * 衝突確率は内容比較で十分低いが、 重大判定 (= 課金 / 認証) には使わない。
+ * Lightweight 32-bit hash (djb2-like). Not cryptographic; used only as a fast
+ * equality check. The collision probability is low enough for content
+ * comparison, but it must not be used for critical decisions (billing / auth).
  */
 function hashString(s: string): number {
   let h = 5381;
@@ -74,11 +83,11 @@ function resourceHash(contents: unknown): number {
 export interface SubscribeManager {
   subscribe(uri: string): void;
   unsubscribe(uri: string): void;
-  /** shutdown / 切断時 = polling 停止 + subscription set クリア。 */
+  /** On shutdown / disconnect: stop polling and clear the subscription set. */
   shutdown(): void;
-  /** test 用 = polling cycle を 1 回 即時 trigger する。 */
+  /** For tests: trigger one polling cycle immediately. */
   pollNow(): Promise<void>;
-  /** test 用 = 現 subscription set snapshot。 */
+  /** For tests: snapshot of the current subscription set. */
   snapshot(): { uris: string[]; pollerActive: boolean };
 }
 
@@ -87,13 +96,13 @@ export function setupSubscribe(ctx: SubscribeContext): SubscribeManager {
   const lastHashes = new Map<string, number>();
   const pollIntervalMs = ctx.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   let pollTimer: NodeJS.Timeout | null = null;
-  // Codex round 1 HIGH 1 fix carry = single-flight guard。 setInterval は 前 cycle
-  // が終わっていなくても 次の cycle を 並列 起動するため、 遅い fetch 1 つ
-  // (= 5xx + 長 retry / 60 秒 超過 latency) で polling が overlap し、
-  // backend 負荷 spike + 重複 notification を 起こす。
+  // Single-flight guard. setInterval starts the next cycle in parallel even if
+  // the previous one has not finished, so a single slow fetch (5xx with long
+  // retries / latency over 60 seconds) would overlap polling cycles, spiking
+  // backend load and duplicating notifications.
   let pollInFlight = false;
-  // Codex round 1 HIGH 2 fix carry = shutdown race 防御。 cycle 開始後に
-  // shutdown が来た場合、 残り URI に対する notify を 全 skip する。
+  // Shutdown race defense: if shutdown arrives after a cycle has started, skip
+  // notifications for all remaining URIs.
   let isShuttingDown = false;
 
   async function pollOnce(): Promise<void> {
@@ -103,8 +112,8 @@ export function setupSubscribe(ctx: SubscribeContext): SubscribeManager {
     try {
       const uris = Array.from(subscriptions);
       for (const uri of uris) {
-        // Codex round 1 HIGH 2 fix carry = cycle 内 unsubscribe / shutdown 検出。
-        // uris snapshot 取得後に unsubscribe された URI に対しては notify しない。
+        // Detect unsubscribe / shutdown within the cycle: never notify for a
+        // URI that was unsubscribed after the uris snapshot was taken.
         if (isShuttingDown) return;
         if (!subscriptions.has(uri)) continue;
         let result: Awaited<ReturnType<typeof readResource>>;
@@ -115,14 +124,15 @@ export function setupSubscribe(ctx: SubscribeContext): SubscribeManager {
             apiBase: ctx.apiBase,
           });
         } catch (err) {
-          // 401 / network / 5xx 等の 一時的 failure は silent skip (= 次回 cycle で
-          // 再試行)。 hash 更新しない (= 「fetch 不可 = 変化なし」 扱いで 不要
-          // notification 抑制)。 debug 時のみ stderr に carry。
+          // Transient failures (401 / network / 5xx) are silently skipped and
+          // retried on the next cycle. The hash is not updated ("cannot fetch"
+          // is treated as "no change" to suppress spurious notifications).
+          // Logged to stderr only in debug mode.
           //
-          // Codex round 2 LOW 3 fix carry = error.message は upstream の
-          // response body / 内部実装文字列を含む可能性があるため、 default は
-          // errorClass のみ log。 full message が必要な場合は別途 redact pattern
-          // 軸で carry path (= 現状 carry なし)。
+          // error.message may contain the upstream response body or internal
+          // implementation strings, so by default only errorClass is logged.
+          // If the full message is ever needed, it should go through a
+          // separate redaction pattern (not implemented today).
           if (isDebugEnabled()) {
             // eslint-disable-next-line no-console
             console.error(
@@ -151,11 +161,12 @@ export function setupSubscribe(ctx: SubscribeContext): SubscribeManager {
               params: { uri },
             });
           } catch (err) {
-            // notification 送信失敗 (= transport 切断 / 一時的 error) は silent
-            // skip だが、 fetch 失敗と path を分けて log carry (= MEDIUM 2 fix、
-            // operational blind spot 解消)。 次回 cycle で 変化検出すれば 再 notify
-            // される。 LOW 3 fix carry = errorClass のみ log (= upstream message
-            // 経由の情報漏洩 構造防御)。
+            // Notification send failures (transport disconnect / transient
+            // error) are silently skipped, but logged on a separate path from
+            // fetch failures to avoid an operational blind spot. If a change
+            // is detected again next cycle, a new notification is sent. Only
+            // errorClass is logged, as a structural defense against leaking
+            // information through upstream messages.
             if (isDebugEnabled()) {
               // eslint-disable-next-line no-console
               console.error(
@@ -180,10 +191,10 @@ export function setupSubscribe(ctx: SubscribeContext): SubscribeManager {
     pollTimer = setInterval(() => {
       void pollOnce();
     }, pollIntervalMs);
-    // Node.js では setInterval の timer が default で event loop に登録される。
-    // unref で 「他に pending task が無くなれば process 終了可能」 にする
-    // (= shutdown 漏れ 防御)。 setInterval の戻り値型は Node では unref を
-    // 持つが TS 型では optional のため guard。
+    // In Node.js, a setInterval timer keeps the event loop alive by default.
+    // unref lets the process exit once no other pending tasks remain (guards
+    // against missed shutdowns). Node's setInterval return value has unref,
+    // but the TS type marks it optional, hence the guard.
     if (typeof pollTimer.unref === "function") {
       pollTimer.unref();
     }
@@ -198,8 +209,9 @@ export function setupSubscribe(ctx: SubscribeContext): SubscribeManager {
   ctx.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
     const uri = request.params.uri;
     if (!ctx.apiKey) {
-      // introspection-only モード(キー無し起動、2026-07)では購読を受け付けない。
-      // 受けると 60 秒ごとの空キー 401 polling が永続する(Codex LOW)。
+      // In introspection-only mode (keyless startup), subscriptions are not
+      // accepted. Accepting one would create a permanent 60-second polling
+      // loop of empty-key 401s.
       throw new McpError(
         ErrorCode.InvalidParams,
         "ARGOSVIX_API_KEY is required for subscriptions. Get a key at " +
@@ -207,9 +219,9 @@ export function setupSubscribe(ctx: SubscribeContext): SubscribeManager {
       );
     }
     if (!SUBSCRIBABLE_URIS.has(uri)) {
-      // Codex round 1 MEDIUM 1 fix carry = McpError(InvalidParams) で throw して
-      // client に正しい -32602 を返す (= 旧実装は raw Error で SDK が
-      // InternalError に変換、 InvalidParams semantic が落ちる)。
+      // Throw McpError(InvalidParams) so the client gets the correct -32602.
+      // The old implementation threw a raw Error, which the SDK converted to
+      // InternalError, losing the InvalidParams semantics.
       throw new McpError(
         ErrorCode.InvalidParams,
         `Resource ${uri} does not support subscriptions. Subscribable URIs: ${Array.from(
@@ -242,9 +254,9 @@ export function setupSubscribe(ctx: SubscribeContext): SubscribeManager {
       if (subscriptions.size === 0) stopPolling();
     },
     shutdown(): void {
-      // Codex round 1 HIGH 2 fix carry = in-flight cycle が ある 場合に
-      // notify suppress を 即時有効化。 stopPolling() 後の cycle 内 残 URI
-      // への notify を 構造防御。
+      // If a cycle is in flight, enable notification suppression immediately.
+      // This structurally prevents notifications for URIs still being
+      // processed within the cycle after stopPolling().
       isShuttingDown = true;
       stopPolling();
       subscriptions.clear();

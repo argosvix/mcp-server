@@ -1,18 +1,21 @@
 /**
- * MCP tool / resource / prompt 説明の英語オーバーレイ (= 2026-07-03)。
+ * English overlay for MCP tool / resource / prompt descriptions.
  *
- * 正本は tools.ts / resources.ts / prompts.ts の日本語 description。本ファイルは
- * ツール名 → 英訳 のマップだけを持ち、 tools/list 等の応答時に lang=en なら
- * deep copy へ適用する (= 元オブジェクトは汚さない)。
+ * The canonical source is the Japanese descriptions in tools.ts / resources.ts
+ * / prompts.ts. This file holds only a map of tool name → English translation;
+ * when lang=en, responses like tools/list apply it to a deep copy (the
+ * original objects are never mutated).
  *
- * 言語解決 = 環境変数 ARGOSVIX_MCP_LANG ("ja" | "en")。未設定・不明値は en
- * (= 国際標準に合わせる。 日本語で使う場合のみ ja を明示)。
+ * Language resolution = the ARGOSVIX_MCP_LANG env var ("ja" | "en"). Unset or
+ * unknown values fall back to en (matching the international default; ja is
+ * set explicitly for Japanese use).
  *
- * inputs の key は inputSchema の properties への dot 区切り path。
- * 配列は items を透過的に降りる (= 例 "items.inputText" は
- * properties.items.items.properties.inputText を指す)。
- * drift 防御 = toolDescriptionsEn.test.ts が「実スキーマの description 持ち
- * フィールド全部 ⇔ オーバーレイの inputs キー全部」の集合一致を assert する。
+ * The inputs keys are dot-separated paths into the inputSchema properties.
+ * Arrays are traversed transparently through items (e.g. "items.inputText"
+ * refers to properties.items.items.properties.inputText).
+ * Drift defense: toolDescriptionsEn.test.ts asserts set equality between "all
+ * description-bearing fields in the real schema" and "all inputs keys in the
+ * overlay".
  */
 
 import type {
@@ -24,7 +27,7 @@ import type {
 
 export type McpLang = "ja" | "en";
 
-/** ARGOSVIX_MCP_LANG の解釈。 ja のみ ja、 それ以外 (未設定含む) は en。 */
+/** Interprets ARGOSVIX_MCP_LANG. Only "ja" yields ja; everything else (including unset) is en. */
 export function resolveMcpLang(raw: string | undefined): McpLang {
   if (raw === "ja") return "ja";
   if (raw !== undefined && raw !== "" && raw !== "en") {
@@ -38,7 +41,7 @@ export function resolveMcpLang(raw: string | undefined): McpLang {
 
 export interface ToolOverlayEn {
   description: string;
-  /** inputSchema の description 持ちフィールドの英訳 (= dot path → 英文)。 */
+  /** English translations for the inputSchema's description-bearing fields (dot path → English text). */
   inputs?: Record<string, string>;
 }
 
@@ -46,7 +49,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
   query_calls: {
     description:
       "Retrieve recent LLM call records captured by Argosvix. " +
-      "Filterable by provider / model / time range / tag. Defaults to the last 24 hours, 100 records.",
+      "Filterable by provider / model / time range / tag (tagKey + tagValue pair). Defaults to the last 24 hours, 100 records.",
     inputs: {
       limit: "Number of records to return (1-500, default 100)",
       provider: "Provider to filter by (openai / anthropic / gemini / mistral). Omit for all providers",
@@ -57,6 +60,9 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
       beforeTimestamp:
         "Keyset pagination cursor (timestamp of the last row on the previous page, ISO-8601). Must be used together with beforeId. Descending timestamp order only",
       beforeId: "Keyset pagination cursor (id of the last row on the previous page). Must be used together with beforeTimestamp",
+      tagKey:
+        "Tag key to filter by (alphanumeric + _ - only, 1-64 chars, must not start or end with -). Must be used together with tagValue (either one alone returns 400)",
+      tagValue: "Tag value to filter by (exact match, 1-256 chars). Must be used together with tagKey",
     },
   },
   get_cost_summary: {
@@ -149,15 +155,15 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
       evalCriterionId:
         "Required when alertType=eval_score. The id of the eval criterion to watch (list_eval_criteria.criteria[].id). Fires when the mean score in the recent window drops below thresholdValue.",
       conditions:
-        "v1.5 multi-condition alert (composite conditions). When specified, single-metric evaluation via alertType + thresholdValue + " +
+        "Multi-condition alert (composite conditions). When specified, single-metric evaluation via alertType + thresholdValue + " +
         "windowMinutes is ignored and the conditions JSON switches to AND/OR aggregation. " +
         "Example: {\"operator\":\"AND\",\"conditions\":[{\"metric\":\"cost_threshold\",\"threshold\":100,\"windowMinutes\":60,\"comparator\":\">\"},{\"metric\":\"error_rate\",\"threshold\":0.05,\"windowMinutes\":60,\"comparator\":\">\"}]}." +
-        " The backend validates the shape via parseConditionsJson (operator AND/OR, 1-8 conditions, each requiring metric/threshold/windowMinutes/comparator). Omit (null) to stay on the single-metric path.",
+        " The backend validates the shape via parseConditionsJson (operator AND/OR, 1-8 conditions, each requiring metric/threshold/windowMinutes/comparator). Omit (null) to keep single-metric evaluation.",
       "conditions.operator":
         "Aggregation operator for the composite condition. AND = triggers when all sub-conditions pass; OR = triggers when at least one passes.",
       "conditions.conditions": "1-8 sub-conditions. More than 8 is rejected by the backend with 400.",
       "conditions.conditions.metric":
-        "Target metric (same enum values as alertType: cost_threshold / error_rate / latency_p95 etc.)",
+        "Target metric. Use the same values as alertType (cost_threshold / error_rate / latency_degradation / monthly_budget etc.). Any other value (e.g. latency_p95) is never evaluated, so the condition can never pass.",
       "conditions.conditions.threshold":
         "Threshold (unit depends on the metric: USD for cost, % for error_rate, ms for latency).",
       "conditions.conditions.windowMinutes": "Aggregation window (minutes, 5-43200). Independent per sub-condition.",
@@ -175,8 +181,8 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
       name: "Display name of the alert (1-100 chars, no line breaks). Omit to keep the current value",
       thresholdValue: "Threshold (>= 0). Omit to keep the current value",
       windowMinutes: "Aggregation window (minutes, 5-43200). Omit to keep the current value",
-      filterProvider: "Target provider. Omit to keep the current value; pass an explicit null to reset to all providers",
-      filterModel: "Target model (substring match). Omit to keep the current value; pass an explicit null to reset to all models",
+      filterProvider: "Target provider. Omit to keep the current value. Clearing the filter is not possible through this tool (recreate via delete_alert + create_alert if needed)",
+      filterModel: "Target model (substring match). Omit to keep the current value. Clearing the filter is not possible through this tool (recreate via delete_alert + create_alert if needed)",
       channelKinds: "Notification channel kinds to enable. Omit to keep the current value. Updating together with channelTargets is recommended",
       channelTargets: "Destination object for every kind listed in channelKinds. Omit to keep the current value",
       "channelTargets.email": "Notification email address",
@@ -187,7 +193,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
       sleepMinutes: "Suppression window for repeated notifications (minutes, 5-10080). Omit to keep the current value",
       enabled: "Alert enabled flag. false pauses evaluation (unlike silence, re-enabling requires another PATCH)",
       conditions:
-        "Update of the v1.5 multi-condition alert. When specified, the single-metric path is ignored in favor of " +
+        "Update of the multi-condition (composite) alert. When specified, the single-metric path is ignored in favor of " +
         "AND/OR aggregation. Can overwrite either an existing single-metric or multi-condition alert.",
     },
   },
@@ -324,7 +330,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
       "A name matching a global default is structurally allowed (UNIQUE (account_id, name) separates it from account_id IS NULL). " +
       "type defaults to 'llm_judge' (judge LLM scoring). Specifying a deterministic evaluator type (exact_match / contains / regex / json_schema / json_path) " +
       "scores without calling an LLM — free and instant (pass -> scaleMax / fail -> scaleMin). Deterministic types require config. " +
-      "The path an AI agent takes when it decides \"add this criterion\" during dogfood evals.",
+      "The path an AI agent takes when it decides \"add this criterion\" while evaluating your own workloads.",
     inputs: {
       name: "Criterion name (1-50 chars, starts with an alphanumeric, [A-Za-z0-9 _\\-.] only). E.g. 'helpfulness' / 'concise'",
       rubric:
@@ -389,7 +395,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
   },
   get_budget_gate: {
     description:
-      "Get the runtime budget gate settings (runtime control plane Phase 1) plus this month's LLM spend. " +
+      "Get the runtime budget gate settings (part of the runtime control plane) plus this month's LLM spend. " +
       "Response = { gates: [{ id, projectId, monthlyLimitUsd, enforceMode, enabled, ... }], spentUsdThisMonth, monthStart, ttlSeconds }. monthStart is the UTC month start. " +
       "The same source the SDK's budgetGate opt-in evaluates before execution. Distinct from get_llm_budget (which caps Argosvix's internal AI feature costs) — this one is a monthly cap on your own LLM spend. " +
       "Example phrasing: \"how much budget gate headroom is left this month?\" / \"is the gate set to fail_open?\"",
@@ -431,7 +437,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
   },
   request_approval: {
     description:
-      "Create an approval request in the human approval gate (runtime control plane Phase 3; Pro+ only). Call it before dangerous operations (deletion / money transfer / account closure etc.); the account owner gets an email notification and a human approves or denies via the dashboard or the email link. " +
+      "Create an approval request in the human approval gate (part of the runtime control plane; Pro+ only). Call it before dangerous operations (deletion / money transfer / account closure etc.); the account owner gets an email notification and a human approves or denies via the dashboard or the email link. " +
       "Important: no MCP tool exists to approve or deny (an AI agent cannot self-approve its own request). Poll the result with get_approval. " +
       "Expiry after timeoutSeconds (default 3600) counts as denied. " +
       "Server-side consumption: passing approvalId to a dangerous mutation tool (bulk_delete_calls / purge_expired_plaintext / retry_failed_webhook / auto_silence_noisy_alert / extend_customer_trial / apply_promo_code_to_customer) makes the backend verify action match + approved + within expiry + unconsumed, and consume it on execution (1 approval = 1 execution). In that case create the request with an action exactly matching the target tool name. " +
@@ -459,7 +465,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
   },
   get_policy_gate: {
     description:
-      "Get the runtime policy gate settings (runtime control plane Phase 2). " +
+      "Get the runtime policy gate settings (part of the runtime control plane). " +
       "Response = { policy: { id, modelAllowlist, blockPii, blockSecrets, enforceMode, enabled, ... } | null }. " +
       "The config the SDK's policyGate opt-in evaluates locally before each LLM call (exact-match model allowlist + blocking on PII / secret detection). " +
       "Example phrasing: \"what model restrictions are active right now?\" / \"is PII blocking enabled?\"",
@@ -546,12 +552,12 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
     description:
       "Partially update an outbound event webhook (Pro+ only, PATCH /v1/webhooks/:id). " +
       "Only the specified fields change (url / secret / eventTypes / description / enabled). " +
-      "Sending secret as null removes the signature; re-enabling with enabled=true also resets the consecutive-failure counter. " +
+      "Omit secret to keep the current value; sending an empty string \"\" removes the signature (null cannot be sent through this schema). Re-enabling with enabled=true also resets the consecutive-failure counter. " +
       "Other accounts' webhooks return 404. webhookId is the id from list_webhooks.",
     inputs: {
       webhookId: "Target webhook id (owh_...)",
       url: "New URL (HTTPS required)",
-      secret: "New secret (empty / null removes it)",
+      secret: "New secret. Omit to keep the current value; an empty string \"\" removes the signature (null cannot be sent)",
       eventTypes: "Array of subscribed event kinds (empty = all)",
       description: "Display memo",
       enabled: "Enabled flag",
@@ -591,7 +597,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
     description:
       "Register one new prompt template (Pro+ only). name + version + template are required; " +
       "variables / labels / description are optional. An existing (name, version) pair returns 409 (UNIQUE constraint). " +
-      "Used when an AI agent auto-registers templates for dogfood evals / experiments.",
+      "Used when an AI agent auto-registers templates for evals / experiments.",
     inputs: {
       name: "Prompt name (series identifier, [A-Za-z0-9][A-Za-z0-9_-]{0,63}). E.g. 'customer_support'",
       version: "Version identifier ([A-Za-z0-9][A-Za-z0-9._-]{0,63}). E.g. 'v1' / '1.0.2' / '2026-06-03'",
@@ -609,10 +615,10 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
     inputs: {
       promptId: "Target prompt id (list_prompts.prompts[].id)",
       template: "New template body (non-empty, up to 50000 chars).",
-      variables: "New variables (plain object; null clears them all).",
+      variables: "New variables (plain object). Omit to keep the current value (null cannot be sent through this schema). To clear them all, pass an empty object {} (overwrites with empty variables).",
       labels: "New labels (full replacement, up to 8, each [A-Za-z0-9][A-Za-z0-9_-]{0,31}).",
       description:
-        "New description (1-500 chars). To explicitly clear the existing description, PATCH other fields without this one (an empty string '' is rejected by the schema — prevents an LLM hallucination from wiping the existing description).",
+        "New description (1-500 chars). Omit to keep the current description. An empty string '' is rejected by the schema (prevents an LLM slip from wiping the existing description); clearing a stored description is not supported through this tool.",
     },
   },
   rename_prompt: {
@@ -683,7 +689,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
       "source includes 'cron' (periodic batch) / 'mcp' (classify_calls_batch on-demand) / 'human_override' / 'api' / 'auto'. " +
       "With callId = all classifier assessments for that call; without callId = account-wide, flagged first then most recent. " +
       "In environments without OPENAI_API_KEY provisioned the cron does not run and this returns an empty array (classify_calls_batch also returns 503). " +
-      "Precondition: safety classification is disabled by default (founder-scoped / off-by-default); no assessments are generated until it is enabled. " +
+      "Precondition: safety classification is disabled by default (a service-side staged rollout switch); no assessments are generated until it is enabled for your account. " +
       "An empty array means \"not enabled / nothing flagged\", not a failure. " +
       "AI agents use this to review recently flagged calls or to check policy-violation candidates for a specific call.",
     inputs: {
@@ -721,7 +727,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
   get_percentiles: {
     description:
       "Get percentile metrics over calls (POST /v1/query/percentiles). metric = 'latency' (ms) or 'cost' (USD); either a single value for the whole range, or a time series with groupBy='day'/'hour'/'minute'. " +
-      "Example phrasing: \"daily p95 latency trend for last week\". Computed with the nearest-rank method via window functions (D1 SQLite has no percentile_cont).",
+      "Example phrasing: \"daily p95 latency trend for last week\". Percentiles are computed with the nearest-rank method.",
     inputs: {
       startTime: "Range start ISO timestamp (UTC; omit = all time)",
       endTime: "Range end ISO timestamp",
@@ -783,7 +789,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
     description:
       "Have an LLM judge (gpt-4o-mini) propose eval criterion candidates from a one-line useCaseHint (e.g. \"customer support bot\") and optional sampleCallIds (representative calls from your account, up to 5) (POST /v1/eval-criteria/propose). An AI agent can finish \"propose criteria to measure our prompt quality\" in one prompt. " +
       "Pro+ only (the backend enforces the plan gate + budget gate); nothing is INSERTed (propose only — adoption is a separate step via create_eval_criterion, structurally limiting LLM-hallucination impact). Decrypt failures for sampleCallIds are reported in partialFailures (the LLM call still runs without samples). " +
-      "Privacy note for prompt samples: with sampleCallIds, the backend decrypts those calls' prompt/response and sends excerpts (1500 chars each) to OpenAI gpt-4o-mini. This re-sends data your SDK originally sent to OpenAI/Anthropic, so no new vendor is added, but be aware it may reach an OpenAI model different from your own LLM calls. If that is a concern, run with useCaseHint only. " +
+      "Privacy note for prompt samples: with sampleCallIds, the backend decrypts those calls' prompt/response and sends excerpts (1500 chars each) to OpenAI gpt-4o-mini. If the sampled calls originally went to OpenAI this is a re-send to the same vendor, but note that samples from other providers (e.g. Gemini / Mistral) are newly sent to OpenAI. If that is a concern, run with useCaseHint only. " +
       "Results are advisory: the returned criteria are LLM proposals and may include semantically weak rubrics (overuse of \"helpful\", duplicates) even when structurally valid. User review before adoption is recommended; do not feed them blindly into create_eval_criterion. " +
       "Returns { criteria: [{ name (snake_case 32 chars), rubric (1-200), scaleMin (=1), scaleMax (5 or 10), reasoning (1-200) }], partialFailures: string[], budgetSpentUsd, proposedRawCount (raw count returned by the LLM), droppedCount (entries removed by the validator) }. Audit: emits an eval.propose_criteria event to the audit log.",
     inputs: {
@@ -809,8 +815,8 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
   retry_failed_webhook: {
     description:
       "Mark failed Stripe webhook events (the billing_dead_letter table) for reprocessing in the audit log (POST /v1/tier2/webhook-events/retry). Finishes \"retry all the Stripe webhooks that failed transiently last week\" in one prompt. " +
-      "Select targets by eventIds (specific events, up to 100) or fromTimestamp/toTimestamp (range, 7-day cap). dryRun=true previews the list; dryRun=false records a 'marked_for_manual_redispatch' entry per event in the audit log (the founder performs the actual retry via wrangler / the Stripe dashboard; fully automatic re-dispatch is a later phase). " +
-      "Emits use a deterministic idempotencyId (sha1(endpoint+accountId+eventId)); duplicate runs with the same args are silently skipped. Founder-operations only (an internal billing-webhook recovery tool; general accounts get 403). billing_dead_letter is an internal cross-account table and actual re-dispatch stays manual, so there is no plan to open this up. " +
+      "Select targets by eventIds (specific events, up to 100) or fromTimestamp/toTimestamp (range, 7-day cap). dryRun=true previews the list; dryRun=false records a 'marked_for_manual_redispatch' entry per event in the audit log (the actual retry is then performed manually by Argosvix operations; fully automatic re-dispatch is planned for a later release). " +
+      "Emits use a deterministic idempotencyId (sha1(endpoint+accountId+eventId)); duplicate runs with the same args are silently skipped. Internal operations tool (billing-webhook recovery); customer accounts receive 403. billing_dead_letter is an internal cross-account table and actual re-dispatch stays manual, so there is no plan to open this up. " +
       "Returns (dryRun=true) { dryRun: true, targetCount, events: [{eventId, eventType, reason, receivedAt}] }; (dryRun=false) { dryRun: false, targetCount, succeeded: string[], failed: [{eventId, reason}], skipped: string[], narrative, retriedAt }. Audit: emits tier2.retry_failed_webhook per event.",
     inputs: {
       eventIds: "Array of Stripe event ids to retry (evt_xxx format, up to 100). Can be combined with fromTimestamp",
@@ -826,7 +832,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
     description:
       "Bulk-silence noisy alerts that fired repeatedly in the past hour (POST /v1/tier2/alerts/auto-silence). Finishes \"this alert fired 50 times in the past hour — silence it for an hour\" in one prompt. " +
       "Specify exactly one of alertId (silence a single alert) or byVolumeThreshold (all alerts with N+ firings in the past hour). silenceDurationMinutes is 5-1440 (5 minutes to 24 hours), default 60. An optional reason can be attached. " +
-      "dryRun=true previews the targets with fireCount; dryRun=false UPDATEs alerts.silenced_until and emits an audit event per alert (tier2.auto_silence_noisy_alert). Because this is a reversible mutation (the existing unsilence_alert can undo it) with strict per-account scoping (other accounts' alerts are unaffected), there is no founder gate — paid Pro+ users can call it directly. " +
+      "dryRun=true previews the targets with fireCount; dryRun=false UPDATEs alerts.silenced_until and emits an audit event per alert (tier2.auto_silence_noisy_alert). Because this is a reversible mutation (the existing unsilence_alert can undo it) with strict per-account scoping (other accounts' alerts are unaffected), no special authorization is required — Pro+ accounts can call it directly. " +
       "Returns (dryRun=true) { dryRun: true, targetCount, silenceUntil, silenceDurationMinutes, lookbackStart, targets: [{alertId, name, fireCount}] }; (dryRun=false) { dryRun: false, targetCount, silenceUntil, silenceDurationMinutes, succeeded: string[], failed: [{alertId, reason}], skipped: string[], reason }. idempotencyId = sha1(endpoint+accountId+alertId+silenceUntil truncated to the minute), coalescing duplicate runs within the same minute.",
     inputs: {
       alertId: "Alert id for single-alert silencing (alrt_xxx format). Cannot be combined with byVolumeThreshold",
@@ -840,7 +846,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
   },
   extend_customer_trial: {
     description:
-      "Extend your account's Stripe subscription trial by 1-30 days (POST /v1/tier2/trial/extend). Founder-operations only (an internal support tool; general accounts get 403). Trial extension directly affects revenue, so there is no plan to open it up. Cumulative cap of 60 days (aggregated from the last 30 days of audit logs); 409 unless status='trialing'. " +
+      "Extend your account's Stripe subscription trial by 1-30 days (POST /v1/tier2/trial/extend). Internal operations tool (support use); customer accounts receive 403. Trial extension directly affects revenue, so there is no plan to open it up. Cumulative cap of 60 days (aggregated from the last 30 days of audit logs); 409 unless status='trialing'. " +
       "dryRun must be passed explicitly (guards against accidental mutation via an implicit false); when dryRun=false, idempotencyKey is also required (16-128 alphanumeric plus '_-'). Re-calling with the same key returns the cached result via the tier2_idempotency table (structurally preventing retry double-extends). " +
       "dryRun=true previews previousTrialEnd / newTrialEnd / the cumulative total only (no Stripe call); dryRun=false performs the actual Stripe mutation plus the accounts_subscription sync update.",
     inputs: {
@@ -855,7 +861,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
   },
   apply_promo_code_to_customer: {
     description:
-      "Apply a user-facing promotion code already registered in Stripe (e.g. 'LAUNCH50') to your account's Stripe subscription (POST /v1/tier2/promo/apply). Founder-operations only (an internal support tool; general accounts get 403). It will not be opened up without terms covering economically impactful operations (timing undecided). 409 if an active discount already exists (structural defense against stacking), and 409 when the status is canceled / incomplete_expired. " +
+      "Apply a user-facing promotion code already registered in Stripe (e.g. 'LAUNCH50') to your account's Stripe subscription (POST /v1/tier2/promo/apply). Internal operations tool (support use); customer accounts receive 403. It will not be opened up without terms covering economically impactful operations (timing undecided). 409 if an active discount already exists (structural defense against stacking), and 409 when the status is canceled / incomplete_expired. " +
       "Redemption is delegated to Stripe via promotion_code (applying coupons directly is forbidden as a constraint bypass); dryRun must be passed explicitly, and idempotencyKey is required when dryRun=false. Re-calls with the same key return the cached result via the tier2_idempotency table, structurally serializing concurrent applies. " +
       "dryRun=true previews resolution + the active-discount check + the estimated discount only (no Stripe mutation); dryRun=false applies the promotion code.",
     inputs: {
@@ -872,7 +878,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
     description:
       "Compare the current window against a baseline window (the immediately preceding window of the same length) and detect anomalies across 4 axes: cost / latency / error_rate / call_volume — lets an AI grasp \"is anything off?\" in one prompt. " +
       "Sensitivity is tunable via threshold: sensitive (1.5x) / normal (2x, default) / conservative (3x). 0-4 detections, each with a narrative. " +
-      "Returns { window, threshold, current: {...}, baseline: {...}, anomalies: [{ axis, severity: 'minor'|'major'|'critical', current, baseline, ratio, narrative }] }. errorRate is evaluated and displayed as a percent (0-100), matching the backend aggregate unit. Insufficient baseline data (fewer than 10 records in the period) yields anomalies: [] plus a warning message.",
+      "Returns { window, threshold, multiplier (the numeric factor behind threshold), current: {...}, baseline: {...}, anomalies: [{ axis, severity: 'minor'|'major'|'critical', current, baseline, ratio, narrative }], partialFailures?: string[] (axes that failed to fetch, as 'current:xxx' / 'baseline:xxx'; omitted when everything succeeds) }. errorRate is evaluated and displayed as a percent (0-100), matching the backend aggregate unit. Insufficient baseline data (fewer than 10 records in the period) yields anomalies: [] plus a warning message (this path omits multiplier; partialFailures is optional in the same way).",
     inputs: {
       window: "Observation window ('1h' / '24h' / '7d', default '24h')",
       threshold: "Sensitivity ('sensitive' 1.5x / 'normal' 2x / 'conservative' 3x, default 'normal')",
@@ -881,8 +887,8 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
   propose_alert_rules: {
     description:
       "Analyze the call patterns over the past lookbackDays (7-30, default 14) and propose recommended alert rules for cost / latency / error_rate / anomaly as JSON. " +
-      "Applying them is a separate step via create_alert after customer confirmation (propose only — zero side effects). Only rules that do not overlap existing alerts are proposed (existing types are fetched via list_alerts). " +
-      "Returns { lookbackDays, baseline: {meanDailyCost (USD), p95Latency (ms), errorRate (percent 0-100), dailyCalls, totalCalls}, proposals: [{ name, alertType, thresholdValue, windowMinutes, reasoning }], skipped: [{ alertType, reason }] }. The thresholdValue of an error_rate proposal is also a percent (consistent with backend create_alert). What big-vendor dashboards show in UI, done MCP-first in one prompt.",
+      "Applying them is a separate step via create_alert after customer confirmation (propose only — zero side effects). Rules whose type already exists are normally not proposed (existing types are fetched via list_alerts); however, if the list_alerts fetch fails, the existing set is treated as empty and overlapping proposals may be returned (failed axes are reported in partialFailures). " +
+      "Returns { lookbackDays, baseline: {meanDailyCost (USD), p95Latency (ms), errorRate (percent 0-100), dailyCalls, totalCalls}, proposals: [{ name, alertType, thresholdValue, windowMinutes, reasoning }], skipped: [{ alertType, reason }], partialFailures?: string[] (axes that failed to fetch; omitted when everything succeeds) }. The thresholdValue of an error_rate proposal is also a percent (consistent with backend create_alert).",
     inputs: {
       lookbackDays: "Lookback days for computing the baseline (7-30, default 14)",
     },
@@ -890,8 +896,8 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
   get_account_health: {
     description:
       "Get a health summary of your LLM infrastructure in one call. Fetches 4 existing endpoints in parallel (aggregate_calls / get_percentiles / get_llm_budget / list_audit_log) and compresses them into one response. " +
-      "Returns { window, totals: {calls, costUsd, errorRate (percent 0-100)}, latency: {p50, p95, p99 (ms)}, budget: {used, limit, percentUsed (0-100)}, recentEvents: count, summary: 'ok' | 'warn' | 'critical' }. critical = errorRate>=10% / budget>=90% / p95>=10s; warn = >=3% / >=70% / >=3s. " +
-      "Example phrasing: \"how is our LLM infra doing right now?\" — answered in one prompt. Pure read aggregator (no new backend endpoint); individual endpoint failures return partial results (one axis timing out does not block the summary).",
+      "Returns { window, totals: {calls, costUsd, errorRate (percent 0-100)}, latency: {p50, p95, p99 (ms)}, budget: {used, limit, percentUsed (0-100)}, recentEvents: count, summary: 'ok' | 'warn' | 'critical', partialFailures?: string[] (axes that failed to fetch; omitted when everything succeeds) }. critical = errorRate>=10% / budget>=90% / p95>=10s; warn = >=3% / >=70% / >=3s. " +
+      "Example phrasing: \"how is our LLM infra doing right now?\" — answered in one prompt. Pure read aggregator (no new backend endpoint); individual endpoint failures return partial results (one axis timing out does not block the summary; failed axes are listed in partialFailures).",
     inputs: {
       window: "Observation window ('1h' / '24h' / '7d', default '24h')",
     },
@@ -943,7 +949,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
         "Filter shape = startDate (ISO) + endDate (ISO) + provider (may be empty) + model (may be empty) + limit (number) + preset (string|null) + sortBy? + sortOrder?",
       "filter.startDate": "ISO timestamp (range start)",
       "filter.endDate": "ISO timestamp (range end)",
-      "filter.provider": "Provider ('openai' / 'anthropic' / 'google' etc.); empty = all providers",
+      "filter.provider": "Provider ('openai' / 'anthropic' / 'gemini' / 'mistral'); empty = all providers",
       "filter.model": "Model name; empty = all models",
       "filter.limit": "Cap on returned records",
       "filter.preset": "Preset identifier (dashboard default filter; null allowed)",
@@ -966,7 +972,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
     inputs: {
       startTime: "Range start ISO timestamp (UTC; omit = all time)",
       endTime: "Range end ISO timestamp (UTC; omit = now)",
-      provider: "Provider filter (openai / anthropic / google / azure / cohere)",
+      provider: "Provider filter (openai / anthropic / gemini / mistral)",
       model: "Model name filter (exact match, no substring matching; e.g. 'gpt-4o-mini')",
       limit: "Cap on returned records. Passed through when within the plan max; clamped to the plan max beyond it",
     },
@@ -974,7 +980,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
   bulk_delete_calls: {
     description:
       "Bulk-delete the given call ids (max 100), scoped to your account (POST /v1/calls/bulk-delete). " +
-      "Useful for cleaning up garbage calls accumulated by dogfooding / dev tests. " +
+      "Useful for cleaning up junk calls accumulated during development and testing. " +
       "dryRun=true returns the matched count before deleting. The delete is one atomic SQL statement; a bulk_deleted event is recorded in the audit log. " +
       "Per FK constraints, related traces / annotations / scores are cascade-deleted via ON DELETE.",
     inputs: {
@@ -1000,7 +1006,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
       "Pro+ only (Free gets 403); environments without OPENAI_API_KEY provisioned return 500 from the backend. " +
       "Precondition: only calls with plaintext storage (the content-storage opt-in) ON are scored. With the opt-in OFF (the default) there are zero candidates and the run returns " +
       "summary.scoredCount=0 with reason='no_plaintext_calls' (gating, not a failure). " +
-      "Cost: about $0.01 per run (20 calls x 5 criteria = 100 LLM calls); around 30 runs/month = $0.30 at founder-dogfood scale.",
+      "Cost: about $0.01 per run (20 calls x 5 criteria = 100 LLM calls); e.g. 30 runs/month is about $0.30.",
     inputs: {
       name: "Free-form run name (1-100 chars, e.g. 'weekly-prod-eval-2026-06-02')",
       recentCount: "Number of calls to evaluate (1-20, default 10). The most recent N calls are passed to the judge.",
@@ -1052,7 +1058,7 @@ export const TOOL_DESCRIPTIONS_EN: Record<string, ToolOverlayEn> = {
   },
 };
 
-/** resources (= 3 件) の英語オーバーレイ。 key は resources[].name。 */
+/** English overlay for the 3 resources. Keys are resources[].name. */
 export const RESOURCE_OVERLAYS_EN: Record<
   string,
   { title: string; description: string }
@@ -1080,7 +1086,7 @@ export const RESOURCE_OVERLAYS_EN: Record<
   },
 };
 
-/** resource templates (= 8 件) の英語オーバーレイ。 key は resourceTemplates[].name。 */
+/** English overlay for the 8 resource templates. Keys are resourceTemplates[].name. */
 export const RESOURCE_TEMPLATE_OVERLAYS_EN: Record<
   string,
   { title: string; description: string }
@@ -1162,7 +1168,7 @@ export const RESOURCE_TEMPLATE_OVERLAYS_EN: Record<
   },
 };
 
-/** prompts (= 3 件) の英語オーバーレイ。 key は prompts[].name、 arguments は 引数名 → 英文。 */
+/** English overlay for the 3 prompts. Keys are prompts[].name; arguments maps argument name → English text. */
 export const PROMPT_OVERLAYS_EN: Record<
   string,
   { title: string; description: string; arguments?: Record<string, string> }
@@ -1197,10 +1203,10 @@ export const PROMPT_OVERLAYS_EN: Record<
 };
 
 /**
- * JSON Schema の node を dot path で辿る (= 配列は items を透過的に降りる)。
- * 例: "conditions.conditions.metric" は
- * properties.conditions.properties.conditions.items.properties.metric を指す。
- * drift テストからも参照される。
+ * Walks a JSON Schema node by dot path (arrays are traversed transparently
+ * through items). Example: "conditions.conditions.metric" refers to
+ * properties.conditions.properties.conditions.items.properties.metric.
+ * Also referenced from the drift test.
  */
 export interface SchemaNode {
   description?: unknown;
@@ -1221,14 +1227,15 @@ export function resolveSchemaNode(
   return node;
 }
 
-/** deep copy (= tool / resource / prompt 定義は plain JSON なので JSON 往復で足りる)。 */
+/** Deep copy (tool / resource / prompt definitions are plain JSON, so a JSON round-trip suffices). */
 function deepCopy<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
 /**
- * tools/list へ返す tool 一覧に言語を適用する。 ja = 正本そのまま (= 参照を返す)、
- * en = deep copy に英訳オーバーレイを適用 (= 元オブジェクトは汚さない)。
+ * Applies the language to the tool list returned by tools/list. ja = the
+ * canonical objects as-is (returns the references); en = the English overlay
+ * applied to a deep copy (the originals are never mutated).
  */
 export function localizeTools(list: Tool[], lang: McpLang): Tool[] {
   if (lang !== "en") return list;

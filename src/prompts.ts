@@ -1,17 +1,21 @@
 /**
- * MCP prompt definitions + handler (= Phase 3、 v0.4.0-alpha.1)。
+ * MCP prompt definitions and handler (added in v0.4.0-alpha.1).
  *
- * Prompt は 「user が 明示的に 選んで 起動する template message」 (= slash command 的)。
- * Argosvix では 「LLM observability の 典型 query」 を 1 click で 投入できる scaffold
- * として 3 件 用意する。 各 prompt は user role の text 1 件で、 内容として 必要な
- * argosvix tool 呼出しを agent に 指示する。
+ * A prompt is a template message the user explicitly selects and launches
+ * (similar to a slash command). Argosvix provides 3 of them as scaffolds that
+ * inject a typical LLM observability query in one click. Each prompt is a
+ * single user-role text message that instructs the agent to make the needed
+ * argosvix tool calls.
  *
- * v0.4.0 prompts:
- *   - cost_review       = 24h / 7d / 30d の cost トレンドを分析、 異常を report
- *   - alert_audit       = 現 alert 設定を 監査し、 plan / 用途に応じた 改善案を出す
- *   - incident_triage   = 直近 N 時間の error / latency 異常を 調査、 root cause を推定
+ * Prompts:
+ *   - cost_review       = analyze 24h / 7d / 30d cost trends and report anomalies
+ *   - alert_audit       = audit current alert settings and suggest improvements
+ *                         appropriate to the plan / use case
+ *   - incident_triage   = investigate error / latency anomalies in the last N
+ *                         hours and estimate the root cause
  *
- * v0.5 候補: 動的 argument 補完 (= completion API)、 model 別 / provider 別 template。
+ * Future candidates: dynamic argument completion (completion API), per-model /
+ * per-provider templates.
  */
 
 import type {
@@ -144,10 +148,12 @@ function buildAlertAudit(): GetPromptResult {
 
 function buildIncidentTriage(args: Record<string, unknown>): GetPromptResult {
   const hours = sanitizeHours(args["hours"]);
-  // Codex v0.4.0 MEDIUM 3 fix: 「直近 N 時間を調査」 と書きつつ rangePreset="24h" 固定で
-  // 自己矛盾していた手順を、 hours に応じた絶対時刻レンジ (= startTime/endTime ISO) に
-  // 統一する。 query_calls は rangePreset を 受け付けないので body 直接渡しは不可、
-  // 代わりに startTime/endTime を 計算して text 中に明示する (= LLM に 渡すのは絶対値)。
+  // The instructions used to say "investigate the last N hours" while
+  // hard-coding rangePreset="24h", which was self-contradictory. Unified to an
+  // absolute time range (startTime/endTime ISO) derived from hours. query_calls
+  // does not accept rangePreset, so it cannot be passed in the body directly;
+  // instead startTime/endTime are computed and stated explicitly in the text
+  // (the LLM receives absolute values).
   const now = Date.now();
   const startIso = new Date(now - hours * 3600 * 1000).toISOString();
   const endIso = new Date(now).toISOString();
@@ -179,8 +185,8 @@ function buildIncidentTriage(args: Record<string, unknown>): GetPromptResult {
 }
 
 function sanitizeMonth(value: unknown): string | null {
-  // Codex v0.4.0 MEDIUM 2 fix: YYYY-MM 形式に加えて 月の semantic 範囲 (1-12) も
-  // gate する (= "2026-99" 等の意味論的に無効な値が prompt 本文に混入するのを 防ぐ)。
+  // In addition to the YYYY-MM shape, gate the month's semantic range (1-12)
+  // to keep semantically invalid values like "2026-99" out of the prompt body.
   if (typeof value !== "string") return null;
   const m = /^(\d{4})-(\d{2})$/.exec(value);
   if (!m) return null;
